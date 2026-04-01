@@ -1,0 +1,15 @@
+{
+  "name": "echo-ios-dependencies",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone companion runtime assets and build scripts for iOS mirroring support",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build:macos:uxplay": "node uxplay/scripts/download-and-build-uxplay-macos.js",
+    "bundle:macos": "node scripts/bundle-macos-companion.js",
+    "build:macos": "npm run build:macos:uxplay && npm run bundle:macos"
+  },
+  "devDependencies": {
+    "adm-zip": "^0.5.16"
+  }
+}
