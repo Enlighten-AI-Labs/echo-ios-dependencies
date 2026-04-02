@@ -1,6 +1,6 @@
 {
   "name": "echo-ios-dependencies",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Standalone companion runtime assets and build scripts for iOS mirroring support",
   "license": "UNLICENSED",
