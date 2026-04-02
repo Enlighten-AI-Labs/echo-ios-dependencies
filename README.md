@@ -1,6 +1,6 @@
 # Echo iOS Dependencies
 
-This repository contains separately distributed companion runtimes and build scripts for iOS mirroring support on macOS.
+This repository contains separately distributed companion runtimes and build scripts for iOS mirroring support on macOS and Windows.
 
 The intent is to keep these artifacts outside any closed-source desktop application bundle and publish them independently with their own licenses, notices, and release assets.
 
@@ -24,6 +24,13 @@ The macOS packaging flow produces:
 - `dist/echo-ios-dependencies-macos.zip`
   A downloadable bundle containing the companion binaries and notices.
 
+The Windows packaging flow produces:
+
+- `uxplay/resources/temp/airplay-bridge.zip`
+  A packaged Windows iOS bridge binary.
+- `dist/echo-ios-dependencies-windows.zip`
+  A downloadable bundle containing the companion binaries and notices.
+
 ## Local Layout
 
 The bundle layout is:
@@ -44,6 +51,12 @@ Build the macOS companion bundle:
 
 ```bash
 npm run build:macos
+```
+
+Build the Windows companion bundle:
+
+```bash
+npm run build:windows
 ```
 
 ## Notes
