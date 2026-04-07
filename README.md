@@ -24,12 +24,12 @@ The macOS packaging flow produces:
 - `dist/echo-ios-dependencies-macos.zip`
   A downloadable bundle containing the companion binaries and notices.
 
-The Windows packaging flow produces:
+The Windows build and packaging flow produces:
 
 - `uxplay/resources/temp/airplay-bridge.zip`
-  A packaged Windows iOS bridge binary.
+  A packaged Windows iOS bridge binary and runtime.
 - `dist/echo-ios-dependencies-windows.zip`
-  A downloadable bundle containing the companion binaries and notices.
+  A downloadable Windows companion bundle containing the AirPlay bridge, ffmpeg, and manifest metadata.
 
 ## Local Layout
 
@@ -53,15 +53,22 @@ Build the macOS companion bundle:
 npm run build:macos
 ```
 
-Build the Windows companion bundle:
+Build and validate the Windows bridge package:
 
 ```bash
 npm run build:windows
+```
+
+Validate an already-built Windows bridge package:
+
+```bash
+npm run validate:windows:uxplay -- "C:\\path\\to\\echo-airplay.exe"
 ```
 
 ## Notes
 
 - The repository does not need to expose or document any closed-source application internals.
 - Release artifacts should be published through this repository's release process or another standalone distribution channel.
+- The Windows packaging flow now uses a curated GStreamer plugin set and a production-style `-vrtp` smoke test to catch unstable builds before release.
 
 See [runtime-paths.md](./runtime-paths.md) for generic install layout notes.

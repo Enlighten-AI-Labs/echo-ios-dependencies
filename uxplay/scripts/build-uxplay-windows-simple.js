@@ -12,7 +12,25 @@ const os = require('os');
 
 const MSYS2_BASE = process.env.MSYS2_BASE || 'C:\\msys64';
 const MSYS2_BASH = path.join(MSYS2_BASE, 'usr', 'bin', 'bash.exe');
-const MSYS2_PACMAN = path.join(MSYS2_BASE, 'usr', 'bin', 'pacman.exe');
+
+function getToolchainConfig() {
+  const subsystem = (process.env.MSYS2_SUBSYSTEM || process.env.MSYSTEM || 'MINGW64').toUpperCase();
+  if (subsystem === 'UCRT64') {
+    return {
+      subsystem,
+      packagePrefix: 'mingw-w64-ucrt-x86_64',
+    };
+  }
+
+  if (subsystem === 'MINGW64') {
+    return {
+      subsystem,
+      packagePrefix: 'mingw-w64-x86_64',
+    };
+  }
+
+  throw new Error(`Unsupported MSYS2 subsystem: ${subsystem}`);
+}
 
 class UxPlayBuilder {
   constructor() {
@@ -70,17 +88,18 @@ class UxPlayBuilder {
    */
   installDependencies() {
     console.log('\nInstalling build dependencies...');
+    const toolchain = getToolchainConfig();
     
     const packages = [
-      'mingw-w64-ucrt-x86_64-cmake',
-      'mingw-w64-ucrt-x86_64-gcc',
-      'mingw-w64-ucrt-x86_64-ninja',
-      'mingw-w64-ucrt-x86_64-libplist',
-      'mingw-w64-ucrt-x86_64-gstreamer',
-      'mingw-w64-ucrt-x86_64-gst-plugins-base',
-      'mingw-w64-ucrt-x86_64-gst-libav',
-      'mingw-w64-ucrt-x86_64-gst-plugins-good',
-      'mingw-w64-ucrt-x86_64-gst-plugins-bad',
+      `${toolchain.packagePrefix}-cmake`,
+      `${toolchain.packagePrefix}-gcc`,
+      `${toolchain.packagePrefix}-ninja`,
+      `${toolchain.packagePrefix}-libplist`,
+      `${toolchain.packagePrefix}-gstreamer`,
+      `${toolchain.packagePrefix}-gst-plugins-base`,
+      `${toolchain.packagePrefix}-gst-libav`,
+      `${toolchain.packagePrefix}-gst-plugins-good`,
+      `${toolchain.packagePrefix}-gst-plugins-bad`,
     ];
 
     const pacmanCmd = `pacman -S --noconfirm --needed ${packages.join(' ')}`;
@@ -96,7 +115,8 @@ class UxPlayBuilder {
         stdio: 'inherit',
         env: {
           ...process.env,
-          MSYSTEM: 'UCRT64',
+          MSYSTEM: toolchain.subsystem,
+          MSYS2_SUBSYSTEM: toolchain.subsystem,
           CHERE_INVOKING: '1',
         },
         shell: true,
@@ -114,6 +134,7 @@ class UxPlayBuilder {
    */
   configureBuild() {
     console.log('\nConfiguring build with CMake...');
+    const toolchain = getToolchainConfig();
     
     // Clean build directory
     if (fs.existsSync(this.buildDir)) {
@@ -125,7 +146,7 @@ class UxPlayBuilder {
     const buildMsysPath = this.toMsysPath(this.buildDir);
     
     const bonjourSdk = process.env.BONJOUR_SDK_HOME || 'C:/Program Files/Bonjour SDK';
-    const cmakeCmd = `cd "${buildMsysPath}" && export BONJOUR_SDK_HOME="${bonjourSdk}" && cmake .. -G Ninja`;
+    const cmakeCmd = `cd "${buildMsysPath}" && export BONJOUR_SDK_HOME="${bonjourSdk}" && export CFLAGS="-O2 -march=x86-64 -mtune=generic -mno-avx -mno-avx2" && export CXXFLAGS="-O2 -march=x86-64 -mtune=generic -mno-avx -mno-avx2" && cmake .. -G Ninja -DNO_MARCH_NATIVE=ON -DCMAKE_C_FLAGS="$CFLAGS" -DCMAKE_CXX_FLAGS="$CXXFLAGS"`;
     
     // Run through MSYS2 bash
     const bashCmd = `"${MSYS2_BASH}" -lc "${cmakeCmd.replace(/"/g, '\\"')}"`;
@@ -137,7 +158,8 @@ class UxPlayBuilder {
         stdio: 'inherit',
         env: {
           ...process.env,
-          MSYSTEM: 'UCRT64',
+          MSYSTEM: toolchain.subsystem,
+          MSYS2_SUBSYSTEM: toolchain.subsystem,
           CHERE_INVOKING: '1',
         },
         shell: true,
@@ -153,6 +175,7 @@ class UxPlayBuilder {
    */
   build() {
     console.log('\nBuilding UxPlay...');
+    const toolchain = getToolchainConfig();
     
     const buildMsysPath = this.toMsysPath(this.buildDir);
     const ninjaCmd = `cd "${buildMsysPath}" && ninja`;
@@ -167,7 +190,8 @@ class UxPlayBuilder {
         stdio: 'inherit',
         env: {
           ...process.env,
-          MSYSTEM: 'UCRT64',
+          MSYSTEM: toolchain.subsystem,
+          MSYS2_SUBSYSTEM: toolchain.subsystem,
           CHERE_INVOKING: '1',
         },
         shell: true,
@@ -200,6 +224,7 @@ class UxPlayBuilder {
       console.log('==========================================');
       console.log('UxPlay Windows Build');
       console.log('==========================================\n');
+      console.log(`MSYS2 subsystem: ${getToolchainConfig().subsystem}`);
 
       this.checkMsys2();
       this.checkBonjourSdk();
@@ -233,4 +258,3 @@ if (require.main === module) {
 }
 
 module.exports = UxPlayBuilder;
-

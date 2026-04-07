@@ -12,6 +12,15 @@ const fs = require('fs');
 const MSYS2_BASE = process.env.MSYS2_BASE || 'C:\\msys64';
 const MSYS2_BASH = path.join(MSYS2_BASE, 'usr', 'bin', 'bash.exe');
 
+function getToolchainConfig() {
+  const subsystem = (process.env.MSYS2_SUBSYSTEM || process.env.MSYSTEM || 'MINGW64').toUpperCase();
+  if (subsystem !== 'MINGW64' && subsystem !== 'UCRT64') {
+    throw new Error(`Unsupported MSYS2 subsystem: ${subsystem}`);
+  }
+
+  return { subsystem };
+}
+
 function checkMsys2() {
   if (!fs.existsSync(MSYS2_BASH)) {
     throw new Error(
@@ -52,6 +61,7 @@ function checkUxPlaySource() {
 function runBuild() {
   const scriptDir = __dirname;
   const buildScript = path.join(scriptDir, 'build-uxplay-windows.sh');
+  const toolchain = getToolchainConfig();
   
   // Convert Windows path to MSYS2 path format
   const msysPath = scriptDir.replace(/\\/g, '/').replace(/^([A-Z]):/, '/$1').toLowerCase();
@@ -72,7 +82,8 @@ function runBuild() {
     stdio: 'inherit',
     env: {
       ...process.env,
-      MSYSTEM: 'UCRT64',
+      MSYSTEM: toolchain.subsystem,
+      MSYS2_SUBSYSTEM: toolchain.subsystem,
       CHERE_INVOKING: '1',
     },
   });
@@ -99,6 +110,7 @@ try {
   console.log('==========================================');
   console.log('UxPlay Windows Build (Node.js Wrapper)');
   console.log('==========================================\n');
+  console.log(`MSYS2 subsystem: ${getToolchainConfig().subsystem}`);
   
   checkMsys2();
   checkBonjourSdk();
@@ -109,6 +121,5 @@ try {
   console.error('\n❌ Pre-flight check failed:', error.message);
   process.exit(1);
 }
-
 
 

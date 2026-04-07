@@ -7,7 +7,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
+const {
+  REQUIRED_PLUGINS,
+  buildWindowsRuntimeEnv,
+} = require('./windows-gstreamer-runtime');
 // Use Node.js built-in zlib or extract-zip for creating zip files
 // For now, we'll use a simple approach with child_process zip command
 // Fallback to adm-zip if available
@@ -19,11 +23,40 @@ try {
   AdmZip = null;
 }
 
+function normalizeSubsystem(value) {
+  const subsystem = (value || process.env.MSYS2_SUBSYSTEM || process.env.MSYSTEM || 'MINGW64').toUpperCase();
+  if (subsystem !== 'MINGW64' && subsystem !== 'UCRT64') {
+    throw new Error(`Unsupported MSYS2 subsystem: ${subsystem}`);
+  }
+
+  return subsystem;
+}
+
+function getToolchainConfig(msys2Base, subsystem) {
+  const normalizedSubsystem = normalizeSubsystem(subsystem);
+  const toolchainDir = normalizedSubsystem === 'UCRT64' ? 'ucrt64' : 'mingw64';
+  const rootDir = path.join(msys2Base, toolchainDir);
+
+  return {
+    subsystem: normalizedSubsystem,
+    rootDir,
+    binDir: path.join(rootDir, 'bin'),
+    libDir: path.join(rootDir, 'lib'),
+    gstPluginsDir: path.join(rootDir, 'lib', 'gstreamer-1.0'),
+    libexecDir: path.join(rootDir, 'libexec', 'gstreamer-1.0'),
+    objdumpPath: path.join(rootDir, 'bin', 'objdump.exe'),
+  };
+}
+
 class UxPlayPackager {
   constructor() {
     this.rootDir = path.join(__dirname, '..');
     this.resourcesDir = path.join(this.rootDir, 'resources');
-    this.uxplaySource = path.join(this.resourcesDir, 'UxPlay-master');
+    this.uxplaySourceCandidates = [
+      path.join(this.resourcesDir, 'UxPlay-master'),
+      path.join(this.rootDir, '..', '..', 'desktop', 'resources', 'UxPlay-master'),
+    ];
+    this.uxplaySource = this.uxplaySourceCandidates.find((candidate) => fs.existsSync(candidate)) || this.uxplaySourceCandidates[0];
     this.buildDir = path.join(this.uxplaySource, 'build');
     this.packageDir = path.join(this.resourcesDir, 'temp', 'airplay-bridge');
     this.outputZip = path.join(this.resourcesDir, 'temp', 'airplay-bridge.zip');
@@ -33,11 +66,13 @@ class UxPlayPackager {
     this.targetExeName = 'echo-airplay.exe';
     this.targetBatName = 'echo-airplay.bat';
     
-    // MSYS2 UCRT64 paths (default installation)
     this.msys2Base = process.env.MSYS2_BASE || 'C:\\msys64';
-    this.msys2Bin = path.join(this.msys2Base, 'ucrt64', 'bin');
-    this.msys2Lib = path.join(this.msys2Base, 'ucrt64', 'lib');
-    this.msys2GstPlugins = path.join(this.msys2Base, 'ucrt64', 'lib', 'gstreamer-1.0');
+    this.toolchain = getToolchainConfig(this.msys2Base);
+    this.msys2Bin = this.toolchain.binDir;
+    this.msys2Lib = this.toolchain.libDir;
+    this.msys2GstPlugins = this.toolchain.gstPluginsDir;
+    this.msys2Libexec = this.toolchain.libexecDir;
+    this.objdumpPath = this.toolchain.objdumpPath;
   }
 
   /**
@@ -52,6 +87,7 @@ class UxPlayPackager {
       );
     }
     console.log(`✓ MSYS2 found at: ${this.msys2Base}`);
+    console.log(`✓ Using ${this.toolchain.subsystem} toolchain runtime`);
   }
 
   /**
@@ -123,6 +159,93 @@ class UxPlayPackager {
     ];
   }
 
+  getDependencyEntryPoints() {
+    const entryPoints = [
+      path.join(this.buildDir, this.sourceExeName),
+      ...REQUIRED_PLUGINS.map((plugin) => path.join(this.msys2GstPlugins, plugin)),
+    ];
+
+    const scannerSource = path.join(this.msys2Libexec, 'gst-plugin-scanner.exe');
+    if (fs.existsSync(scannerSource)) {
+      entryPoints.push(scannerSource);
+    }
+
+    return entryPoints.filter((entryPath) => fs.existsSync(entryPath));
+  }
+
+  parseDllDependencies(binaryPath) {
+    const output = execFileSync(this.objdumpPath, ['-p', binaryPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 16 * 1024 * 1024,
+    });
+
+    return output
+      .split(/\r?\n/u)
+      .map((line) => line.match(/^\s*DLL Name:\s+(.+)$/u))
+      .filter(Boolean)
+      .map((match) => match[1].trim())
+      .filter(Boolean);
+  }
+
+  findDependencySource(dllName) {
+    const candidates = [
+      path.join(this.msys2Bin, dllName),
+      path.join(this.msys2Lib, dllName),
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  collectDependencyClosure(entryPoints) {
+    if (!fs.existsSync(this.objdumpPath)) {
+      throw new Error(`objdump not found at ${this.objdumpPath}`);
+    }
+
+    const queue = [...entryPoints];
+    const visitedFiles = new Set();
+    const resolvedDependencies = new Map();
+
+    while (queue.length > 0) {
+      const currentPath = queue.pop();
+      if (!currentPath || visitedFiles.has(currentPath) || !fs.existsSync(currentPath)) {
+        continue;
+      }
+
+      visitedFiles.add(currentPath);
+
+      let dllNames;
+      try {
+        dllNames = this.parseDllDependencies(currentPath);
+      } catch (error) {
+        throw new Error(`Failed to inspect dependencies for ${currentPath}: ${error.message}`);
+      }
+
+      for (const dllName of dllNames) {
+        const key = dllName.toLowerCase();
+        if (resolvedDependencies.has(key)) {
+          continue;
+        }
+
+        const sourcePath = this.findDependencySource(dllName);
+        if (!sourcePath) {
+          continue;
+        }
+
+        resolvedDependencies.set(key, sourcePath);
+        queue.push(sourcePath);
+      }
+    }
+
+    return [...resolvedDependencies.values()];
+  }
+
   /**
    * Copy DLLs from MSYS2 to package directory
    */
@@ -130,7 +253,7 @@ class UxPlayPackager {
     console.log('\nCopying required DLLs...');
     const dlls = this.getRequiredDlls();
     let copied = 0;
-    let missing = [];
+    const missing = [];
 
     for (const dll of dlls) {
       const sourcePath = path.join(this.msys2Bin, dll);
@@ -146,109 +269,22 @@ class UxPlayPackager {
       }
     }
 
-    // Copy additional GStreamer-related DLLs that plugins might need
-    const additionalDlls = [
-      'libgstallocators-1.0-0.dll',
-      'libgstcontroller-1.0-0.dll',
-      'libgstnet-1.0-0.dll',
-      'libgsttag-1.0-0.dll',
-      'liborc-0.4-0.dll', // ORC (Optimized Inner Loop Runtime Compiler) - used by many plugins
-    ];
-
-    // Copy FFmpeg libraries (required by libgstlibav.dll) - find by pattern
-    console.log('\nCopying FFmpeg DLLs...');
-    try {
-      const ffmpegDlls = fs.readdirSync(this.msys2Bin).filter(file => 
-        (file.startsWith('avcodec') || file.startsWith('avformat') || 
-         file.startsWith('avutil') || file.startsWith('avfilter') ||
-         file.startsWith('avdevice') || file.startsWith('swscale') ||
-         file.startsWith('swresample')) && file.endsWith('.dll')
-      );
-      
-      for (const dll of ffmpegDlls) {
-        const sourcePath = path.join(this.msys2Bin, dll);
-        const destPath = path.join(this.packageDir, dll);
-        if (!fs.existsSync(destPath)) {
-          fs.copyFileSync(sourcePath, destPath);
-          console.log(`  ✓ ${dll}`);
-          copied++;
-        }
+    console.log('\nTracing transitive DLL dependencies from the bridge and curated plugins...');
+    const dependencyPaths = this.collectDependencyClosure(this.getDependencyEntryPoints());
+    let tracedCopied = 0;
+    for (const sourcePath of dependencyPaths) {
+      const dllName = path.basename(sourcePath);
+      const destPath = path.join(this.packageDir, dllName);
+      if (fs.existsSync(destPath)) {
+        continue;
       }
-    } catch (error) {
-      console.warn(`  ⚠ Could not copy FFmpeg DLLs: ${error.message}`);
+
+      fs.copyFileSync(sourcePath, destPath);
+      tracedCopied++;
     }
-
-    console.log('\nCopying additional GStreamer DLLs...');
-    for (const dll of additionalDlls) {
-      const sourcePath = path.join(this.msys2Bin, dll);
-      const destPath = path.join(this.packageDir, dll);
-
-      if (fs.existsSync(sourcePath)) {
-        if (!fs.existsSync(destPath)) {
-          fs.copyFileSync(sourcePath, destPath);
-          copied++;
-          console.log(`  ✓ ${dll}`);
-        }
-      }
-    }
-
-    // Copy ALL DLLs from MSYS2 bin to ensure we have all dependencies
-    // This is a catch-all to ensure plugins can find their DLL dependencies
-    console.log('\nCopying all remaining DLLs from bin directory...');
-    try {
-      const allDlls = fs.readdirSync(this.msys2Bin).filter(file => 
-        file.endsWith('.dll')
-      );
-      
-      let additionalCopied = 0;
-      for (const dll of allDlls) {
-        const destPath = path.join(this.packageDir, dll);
-        if (!fs.existsSync(destPath)) {
-          const sourcePath = path.join(this.msys2Bin, dll);
-          fs.copyFileSync(sourcePath, destPath);
-          additionalCopied++;
-        }
-      }
-      if (additionalCopied > 0) {
-        console.log(`  ✓ Copied ${additionalCopied} additional DLLs`);
-        copied += additionalCopied;
-      }
-    } catch (error) {
-      console.warn(`  ⚠ Could not copy all DLLs: ${error.message}`);
-    }
-
-    // Also copy DLLs from MSYS2 lib directory (some dependencies might be there)
-    const msys2Lib = path.join(this.msys2Base, 'ucrt64', 'lib');
-    if (fs.existsSync(msys2Lib)) {
-      console.log('\nCopying DLLs from MSYS2 lib directory...');
-      try {
-        const libDlls = fs.readdirSync(msys2Lib, { recursive: true, withFileTypes: true })
-          .filter(dirent => dirent.isFile() && dirent.name.endsWith('.dll'))
-          .map(dirent => path.join(dirent.path, dirent.name));
-        
-        let libCopied = 0;
-        for (const libDll of libDlls) {
-          const dllName = path.basename(libDll);
-          const destPath = path.join(this.packageDir, dllName);
-          
-          // Only copy if not already in package and it's a relevant DLL
-          if (!fs.existsSync(destPath) && 
-              (dllName.startsWith('lib') || dllName.startsWith('av') || dllName.startsWith('sw'))) {
-            try {
-              fs.copyFileSync(libDll, destPath);
-              libCopied++;
-            } catch (err) {
-              // Skip if copy fails (permissions, etc.)
-            }
-          }
-        }
-        if (libCopied > 0) {
-          console.log(`  ✓ Copied ${libCopied} DLLs from lib directory`);
-          copied += libCopied;
-        }
-      } catch (error) {
-        console.warn(`  ⚠ Could not copy DLLs from lib directory: ${error.message}`);
-      }
+    if (tracedCopied > 0) {
+      console.log(`  ✓ Copied ${tracedCopied} traced dependency DLLs`);
+      copied += tracedCopied;
     }
 
     // Also copy dnssd.dll from System32 if available (Bonjour SDK)
@@ -291,39 +327,8 @@ class UxPlayPackager {
     // Create plugins directory
     fs.mkdirSync(pluginsDir, { recursive: true });
 
-    // Copy essential plugins
-    const essentialPlugins = [
-      'libgstcoreelements.dll',
-      'libgsttypefindfunctions.dll',
-      'libgstplayback.dll',
-      'libgstrawparse.dll',
-      'libgstvideoconvert.dll',
-      'libgstvideoscale.dll',
-      'libgstvideorate.dll',
-      'libgstaudioconvert.dll',
-      'libgstaudioresample.dll',
-      'libgstapp.dll',
-      'libgsttcp.dll',
-      'libgstudp.dll',
-      'libgstrtp.dll',
-      'libgstrtsp.dll',
-      'libgstsdp.dll',
-      'libgstvideotestsrc.dll',
-      'libgstaudiotestsrc.dll',
-      'libgstautodetect.dll',
-      'libgstlibav.dll', // For h264/aac decoding
-      'libgstopenh264.dll', // Alternative h264 decoder
-      'libgstx264.dll', // x264 encoder
-      'libgstvideoparsersbad.dll', // h264 parser
-      'libgstvideofilter.dll',
-      'libgstaudiofx.dll',
-      'libgstvolume.dll',
-    ];
-
     let copied = 0;
-    const pluginFiles = fs.readdirSync(this.msys2GstPlugins);
-
-    for (const plugin of essentialPlugins) {
+    for (const plugin of REQUIRED_PLUGINS) {
       const sourcePath = path.join(this.msys2GstPlugins, plugin);
       const destPath = path.join(pluginsDir, plugin);
 
@@ -331,22 +336,20 @@ class UxPlayPackager {
         fs.copyFileSync(sourcePath, destPath);
         copied++;
         console.log(`  ✓ ${plugin}`);
+      } else {
+        throw new Error(`Required GStreamer plugin not found in MSYS2: ${plugin}`);
       }
     }
 
-    // Also copy any other plugins that might be needed
-    for (const file of pluginFiles) {
-      if (file.endsWith('.dll') && !essentialPlugins.includes(file)) {
-        const sourcePath = path.join(this.msys2GstPlugins, file);
-        const destPath = path.join(pluginsDir, file);
-        if (!fs.existsSync(destPath)) {
-          fs.copyFileSync(sourcePath, destPath);
-          console.log(`  + ${file} (additional)`);
-        }
-      }
+    const scannerSource = path.join(this.msys2Libexec, 'gst-plugin-scanner.exe');
+    const scannerDest = path.join(this.packageDir, 'libexec', 'gstreamer-1.0', 'gst-plugin-scanner.exe');
+    if (fs.existsSync(scannerSource)) {
+      fs.mkdirSync(path.dirname(scannerDest), { recursive: true });
+      fs.copyFileSync(scannerSource, scannerDest);
+      console.log('  ✓ gst-plugin-scanner.exe');
     }
 
-    console.log(`\nCopied ${copied} essential plugins`);
+    console.log(`\nCopied ${copied} curated plugins`);
   }
 
   /**
@@ -368,10 +371,14 @@ REM Add root directory first (contains most DLLs), then plugin directory
 set "PATH=%SCRIPT_DIR%;%SCRIPT_DIR%lib\\gstreamer-1.0;%PATH%"
 
 REM Set GStreamer plugin path
-set "GST_PLUGIN_PATH=%SCRIPT_DIR%lib\\gstreamer-1.0"
+set "GST_PLUGIN_PATH=%SCRIPT_DIR%lib\\echo-gstreamer-plugins"
+set "GST_PLUGIN_SYSTEM_PATH_1_0=%SCRIPT_DIR%lib\\echo-gstreamer-plugins"
+set "ORC_CODE=backup"
 
 REM Set GStreamer registry (optional, helps with plugin loading)
 set "GST_REGISTRY=%TEMP%\\gst-registry-%RANDOM%.bin"
+set "GST_REGISTRY_FORK=no"
+if exist "%SCRIPT_DIR%libexec\\gstreamer-1.0\\gst-plugin-scanner.exe" set "GST_PLUGIN_SCANNER=%SCRIPT_DIR%libexec\\gstreamer-1.0\\gst-plugin-scanner.exe"
 
 REM Run AirPlay bridge with the configured environment
 "%SCRIPT_DIR%${this.targetExeName}" %*
@@ -426,6 +433,9 @@ Usage:
 Requirements:
   - Windows 10 or later (64-bit)
   - Network access for AirPlay discovery
+
+Validation:
+  Run node uxplay/scripts/validate-windows-package.js <path-to-echo-airplay.exe>
 `;
 
     const readmePath = path.join(this.packageDir, 'README.txt');
@@ -471,6 +481,28 @@ Requirements:
     console.log(`✓ Size: ${sizeMB} MB`);
   }
 
+  validatePackage() {
+    console.log('\nValidating packaged bridge runtime...');
+    const bridgeExe = path.join(this.packageDir, this.targetExeName);
+    const runtime = buildWindowsRuntimeEnv(bridgeExe, process.env);
+    const validationArgs = [
+      '-n', 'Echo Validation',
+      '-p', '47000,47001,47002',
+      '-vrtp', 'config-interval=1 ! udpsink host=127.0.0.1 port=47010',
+    ];
+
+    const result = execSync(
+      `node "${path.join(__dirname, 'validate-windows-package.js')}" "${bridgeExe}"`,
+      {
+        cwd: this.rootDir,
+        stdio: 'inherit',
+        env: runtime.env,
+      },
+    );
+
+    return result;
+  }
+
   /**
    * Main packaging process
    */
@@ -488,6 +520,7 @@ Requirements:
       this.copyGstPlugins();
       this.createWrapperScript();
       this.createReadme();
+      this.validatePackage();
       this.createZip();
 
       console.log('\n==========================================');

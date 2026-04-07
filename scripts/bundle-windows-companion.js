@@ -2,14 +2,26 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 const AdmZip = require('adm-zip');
 
 const appRoot = path.join(__dirname, '..');
 const uxplayRoot = path.join(appRoot, 'uxplay');
+const ffmpegRoot = path.join(appRoot, 'ffmpeg');
 const distDir = path.join(appRoot, 'dist');
 const tempDir = path.join(appRoot, 'temp', 'windows-companion');
 const uxplayArtifact = path.join(uxplayRoot, 'resources', 'temp', 'airplay-bridge.zip');
 const outputZip = path.join(distDir, 'echo-ios-dependencies-windows.zip');
+
+function resolveWindowsFfmpegBinary() {
+  const candidates = [
+    path.join(ffmpegRoot, 'ffmpeg.exe'),
+    path.join(appRoot, '..', 'desktop', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
+    path.join(appRoot, '..', 'desktop', 'build', 'runtime-node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
 
 function ensureFile(filePath, label) {
   if (!fs.existsSync(filePath)) {
@@ -30,24 +42,6 @@ function copyIfExists(sourcePath, targetPath) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.copyFileSync(sourcePath, targetPath);
   return true;
-}
-
-function resolveWindowsFfmpegSource() {
-  const candidates = [
-    process.env.ECHO_WINDOWS_FFMPEG_PATH,
-    path.join(appRoot, 'ffmpeg', 'ffmpeg.exe'),
-    path.join(appRoot, 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  throw new Error(
-    `Windows ffmpeg binary not found. Checked: ${candidates.join(', ') || '(no candidates)'}`,
-  );
 }
 
 function buildManifest(packageRoot) {
@@ -82,9 +76,11 @@ function main() {
   console.log('Echo iOS Dependencies Windows Bundle');
   console.log('==========================================\n');
 
-  ensureFile(uxplayArtifact, 'UxPlay packaged artifact');
-  const ffmpegSource = resolveWindowsFfmpegSource();
-  ensureFile(ffmpegSource, 'Windows ffmpeg binary');
+  ensureFile(uxplayArtifact, 'Windows AirPlay bridge artifact');
+  const ffmpegBinary = resolveWindowsFfmpegBinary();
+  if (!ffmpegBinary) {
+    throw new Error('Windows ffmpeg binary not found in ios-dependencies or desktop ffmpeg-static locations');
+  }
 
   fs.mkdirSync(distDir, { recursive: true });
   resetDir(tempDir);
@@ -96,39 +92,14 @@ function main() {
   fs.mkdirSync(airplayDir, { recursive: true });
   fs.mkdirSync(ffmpegDir, { recursive: true });
 
-  console.log('[bundle] Extracting packaged UxPlay artifact...');
+  console.log('[bundle] Extracting validated AirPlay bridge artifact...');
   const zip = new AdmZip(uxplayArtifact);
   zip.extractAllTo(airplayDir, true);
 
-  const bridgeCandidates = [
-    path.join(airplayDir, 'echo-airplay.exe'),
-    path.join(airplayDir, 'uxplay.exe'),
-    path.join(airplayDir, 'uxplay-windows.exe'),
-  ];
-  const bridgePath = bridgeCandidates.find((candidate) => fs.existsSync(candidate));
-  if (!bridgePath) {
-    throw new Error(`Expected a Windows bridge executable in ${airplayDir}`);
-  }
-
-  const normalizedBridgePath = path.join(airplayDir, 'echo-airplay.exe');
-  if (bridgePath !== normalizedBridgePath) {
-    fs.copyFileSync(bridgePath, normalizedBridgePath);
-  }
-
   console.log('[bundle] Copying ffmpeg...');
-  fs.copyFileSync(ffmpegSource, path.join(ffmpegDir, 'ffmpeg.exe'));
-
-  const ffmpegCandidates = [
-    [path.join(appRoot, 'ffmpeg', 'LICENSE'), path.join(ffmpegDir, 'LICENSE')],
-    [path.join(appRoot, 'ffmpeg', 'README.md'), path.join(ffmpegDir, 'README.md')],
-    [path.join(path.dirname(ffmpegSource), 'ffmpeg.exe.LICENSE'), path.join(ffmpegDir, 'ffmpeg.exe.LICENSE')],
-    [path.join(path.dirname(ffmpegSource), 'ffmpeg.exe.README'), path.join(ffmpegDir, 'ffmpeg.exe.README')],
-    [path.join(path.dirname(ffmpegSource), 'README.md'), path.join(ffmpegDir, 'ffmpeg-static.README.md')],
-    [path.join(path.dirname(ffmpegSource), 'LICENSE'), path.join(ffmpegDir, 'ffmpeg-static.LICENSE')],
-  ];
-
-  for (const [sourcePath, targetPath] of ffmpegCandidates) {
-    copyIfExists(sourcePath, targetPath);
+  fs.copyFileSync(ffmpegBinary, path.join(ffmpegDir, 'ffmpeg.exe'));
+  for (const fileName of ['LICENSE', 'README.md', 'ffmpeg.LICENSE', 'ffmpeg.README']) {
+    copyIfExists(path.join(ffmpegRoot, fileName), path.join(ffmpegDir, fileName));
   }
 
   const topLevelReadme = `Echo iOS Dependencies (Windows)
@@ -145,9 +116,9 @@ Install these as a separately distributed companion runtime.
 
   console.log('[bundle] Creating downloadable zip...');
   fs.rmSync(outputZip, { force: true });
-  const output = new AdmZip();
-  output.addLocalFolder(packageRoot, path.basename(packageRoot));
-  output.writeZip(outputZip);
+  execSync(`powershell -Command "Compress-Archive -Path '${packageRoot}\\*' -DestinationPath '${outputZip}' -Force"`, {
+    stdio: 'inherit',
+  });
 
   const sizeMb = (fs.statSync(outputZip).size / (1024 * 1024)).toFixed(2);
   console.log(`\n[bundle] Created ${outputZip} (${sizeMb} MB)`);
