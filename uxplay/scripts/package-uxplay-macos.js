@@ -204,6 +204,7 @@ function packageBridge(options = {}) {
   fs.rmSync(outputZip, { force: true });
   fs.rmSync(`${outputZip}.partial`, { force: true });
   fs.rmSync(stagingDir, { recursive: true, force: true });
+  let published = false;
 
   try {
     const minMacOS = requireMinMacOS(options.minMacOS);
@@ -258,13 +259,18 @@ function packageBridge(options = {}) {
     validateBridgeDir(bridgeDir, { requiredPlugins, expectedMinMacOS: minMacOS });
 
     const zip = writeZipAtomically(bridgeDir, outputZip);
-    if (options.beforeCommit) options.beforeCommit(zip.partial);
-    zip.commit();
+    const sha256 = sha256File(zip.partial);
     fs.rmSync(stagingDir, { recursive: true, force: true });
-    return { outputZip, sha256: sha256File(outputZip), provenance, fileCount: Object.keys(hashes).length + 1 };
-  } catch (error) {
-    fs.rmSync(`${outputZip}.partial`, { force: true });
-    throw error;
+    if (options.beforeCommit) options.beforeCommit(zip.partial);
+    // Renaming the zip into place is the last step; nothing after it can fail the run.
+    zip.commit();
+    published = true;
+    return { outputZip, sha256, provenance, fileCount: Object.keys(hashes).length + 1 };
+  } finally {
+    if (!published) {
+      fs.rmSync(outputZip, { force: true });
+      fs.rmSync(`${outputZip}.partial`, { force: true });
+    }
   }
 }
 

@@ -18,6 +18,7 @@ const {
 } = require('../uxplay/scripts/macos-gstreamer-runtime');
 const {
   COMPANION_DIR,
+  FFMPEG_COMPONENT,
   validateBridgeDir,
   validateFfmpeg,
   validateZip,
@@ -32,7 +33,9 @@ const DEFAULTS = {
   tempDir: path.join(appRoot, 'temp', 'macos-companion'),
 };
 
-const FFMPEG_FILES = ['ffmpeg', 'LICENSE', 'README.md', 'ffmpeg.LICENSE', 'ffmpeg.README'];
+// ffmpeg's license notices are required; the READMEs are copied when present.
+const FFMPEG_NOTICES = ['LICENSE', 'ffmpeg.LICENSE'];
+const FFMPEG_DOCS = ['README.md', 'ffmpeg.README'];
 const FFMPEG_FLAGGED_OPTIONS = ['--enable-nonfree', '--enable-gpl', '--enable-version3'];
 
 function sidecarPath(outputZip) {
@@ -62,13 +65,13 @@ function describeFfmpeg(ffmpegPath) {
     sha256: sha256File(ffmpegPath),
     configureOptionsFlagged: flagged,
     component: {
-      name: 'ffmpeg (prebuilt)',
+      name: FFMPEG_COMPONENT,
       version: 'unknown',
       license: flagged.includes('--enable-gpl') ? 'GPL (configure flags: see configureOptionsFlagged)' : 'LGPL-2.1-or-later',
       linkage: 'separate executable',
       sourceUrl: null,
       sourceSha256: null,
-      licenseFiles: ['ffmpeg/LICENSE', 'ffmpeg/ffmpeg.LICENSE'],
+      licenseFiles: FFMPEG_NOTICES.map((name) => `ffmpeg/${name}`),
     },
     gaps,
   };
@@ -77,9 +80,12 @@ function describeFfmpeg(ffmpegPath) {
 function bundleMacosCompanion(options = {}) {
   const opts = { ...DEFAULTS, ...options };
   const sidecar = sidecarPath(opts.outputZip);
-  fs.rmSync(opts.outputZip, { force: true });
-  fs.rmSync(`${opts.outputZip}.partial`, { force: true });
-  fs.rmSync(sidecar, { force: true });
+  // Everything this run may create. Removed up front, and again on failure, so a failed run never
+  // leaves a final zip or sidecar behind. (A hard kill can still leave *.partial files or a sidecar
+  // without its zip; the next run removes them.)
+  const outputs = [opts.outputZip, `${opts.outputZip}.partial`, sidecar, `${sidecar}.partial`];
+  for (const output of outputs) fs.rmSync(output, { force: true });
+  let published = false;
 
   try {
     const minMacOS = requireMinMacOS(opts.minMacOS);
@@ -95,16 +101,21 @@ function bundleMacosCompanion(options = {}) {
     console.log('[bundle] Extracting and validating the AirPlay bridge...');
     safeExtractZip(opts.bridgeZip, airplayDir);
     const provenance = validateBridgeDir(airplayDir, { requiredPlugins: opts.requiredPlugins, expectedMinMacOS: minMacOS });
-    validateFfmpeg(ffmpegPath, minMacOS);
 
     console.log('[bundle] Copying ffmpeg (unchanged)...');
+    for (const name of FFMPEG_NOTICES) {
+      if (!fs.existsSync(path.join(opts.ffmpegDir, name))) {
+        throw new Error(`Required ffmpeg license notice ${name} not found in ${opts.ffmpegDir}`);
+      }
+    }
     fs.mkdirSync(ffmpegDir, { recursive: true });
-    for (const fileName of FFMPEG_FILES) {
+    for (const fileName of ['ffmpeg', ...FFMPEG_NOTICES, ...FFMPEG_DOCS]) {
       const source = path.join(opts.ffmpegDir, fileName);
       if (!fs.existsSync(source)) continue;
       fs.copyFileSync(source, path.join(ffmpegDir, fileName));
       fs.chmodSync(path.join(ffmpegDir, fileName), fileName === 'ffmpeg' ? 0o755 : 0o644);
     }
+    validateFfmpeg(path.join(ffmpegDir, 'ffmpeg'), minMacOS);
     const ffmpeg = describeFfmpeg(path.join(ffmpegDir, 'ffmpeg'));
 
     fs.writeFileSync(path.join(packageRoot, 'README.txt'), `Echo iOS Dependencies (macOS)
@@ -159,12 +170,12 @@ Install these as a separately distributed companion runtime. Homebrew is not req
       requiredPlugins: opts.requiredPlugins,
       expectedMinMacOS: minMacOS,
     });
-    zip.commit();
 
+    // The sidecar is written and renamed first; the zip is renamed into place last.
     const summary = {
       artifact: path.basename(opts.outputZip),
-      sha256: sha256File(opts.outputZip),
-      size: fs.statSync(opts.outputZip).size,
+      sha256: sha256File(zip.partial),
+      size: fs.statSync(zip.partial).size,
       platform: manifest.platform,
       arch: manifest.arch,
       minimumMacOS: manifest.minimumMacOS,
@@ -180,11 +191,11 @@ Install these as a separately distributed companion runtime. Homebrew is not req
     };
     fs.writeFileSync(`${sidecar}.partial`, `${JSON.stringify(summary, null, 2)}\n`);
     fs.renameSync(`${sidecar}.partial`, sidecar);
+    zip.commit();
+    published = true;
     return { outputZip: opts.outputZip, sidecar, summary };
-  } catch (error) {
-    fs.rmSync(`${opts.outputZip}.partial`, { force: true });
-    fs.rmSync(`${sidecar}.partial`, { force: true });
-    throw error;
+  } finally {
+    if (!published) for (const output of outputs) fs.rmSync(output, { force: true });
   }
 }
 

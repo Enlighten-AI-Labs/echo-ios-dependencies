@@ -6,6 +6,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { UXPLAY_PIN, sha256File } = require('../../uxplay/scripts/macos-gstreamer-runtime');
 
+// Companion checkout identity recorded by fixture packaging and bundling (must match between them).
+const FIXTURE_COMPANION = Object.freeze({ commit: '0123456789abcdef0123456789abcdef01234567', dirty: false });
+
 function clang(args, { arch = ['arm64'], minMacOS = '13.0' } = {}) {
   execFileSync('clang', [
     ...arch.flatMap((a) => ['-arch', a]), `-mmacosx-version-min=${minMacOS}`,
@@ -110,12 +113,15 @@ function buildFixture(root) {
   fs.mkdirSync(ffmpegDir, { recursive: true });
   clang([writeSource(src, 'ffmpeg.c', 'int main(void){return 0;}'), '-o', path.join(ffmpegDir, 'ffmpeg')]);
   fs.writeFileSync(path.join(ffmpegDir, 'LICENSE'), 'ffmpeg license\n');
+  fs.writeFileSync(path.join(ffmpegDir, 'ffmpeg.LICENSE'), 'ffmpeg project license\n');
 
   return {
     root,
     prefix,
     src,
     buildInfoPath,
+    binary,
+    optAlpha,
     pluginDir,
     scanner,
     ffmpegDir,
@@ -131,11 +137,19 @@ function buildFixture(root) {
         outputZip: path.join(root, 'out', 'airplay-bridge.zip'),
         stagingDir: path.join(root, 'out', 'staging'),
         downstreamArtifacts: [path.join(root, 'out', 'echo-ios-dependencies-macos.zip')],
-        companion: { commit: 'fixture', dirty: false },
+        companion: FIXTURE_COMPANION,
         ...extra,
       };
     },
   };
+}
+
+/** Recompiles the fixture's UxPlay binary (`-h` must exit 0) and records it in build-info.json. */
+function rebuildBinary(fixture, code, linkArgs) {
+  clang([writeSource(fixture.src, 'main-rebuilt.c', code), ...linkArgs, '-o', fixture.binary]);
+  const info = JSON.parse(fs.readFileSync(fixture.buildInfoPath, 'utf8'));
+  info.binarySha256 = sha256File(fixture.binary);
+  fs.writeFileSync(fixture.buildInfoPath, JSON.stringify(info));
 }
 
 /** Adds an extra plugin to the fixture's plugin dir with custom compile settings. */
@@ -146,4 +160,4 @@ function addPlugin(fixture, name, { arch, minMacOS, extraArgs = [] } = {}) {
   return pluginPath;
 }
 
-module.exports = { addPlugin, buildFixture, clang, makeKeg, writeSource };
+module.exports = { FIXTURE_COMPANION, addPlugin, buildFixture, clang, makeKeg, rebuildBinary, writeSource };

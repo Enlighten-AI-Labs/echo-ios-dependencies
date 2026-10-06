@@ -118,15 +118,26 @@ function run(command, args, options = {}) {
 
 /** Returns 'thin', 'fat' or null based on the file magic. */
 function machOKind(filePath) {
+  return machOHeader(filePath).kind;
+}
+
+const MACHO_FILETYPES = { 2: 'execute', 6: 'dylib', 8: 'bundle' };
+
+/** Reads the Mach-O magic and, for thin files, the header filetype (execute, dylib, bundle, ...). */
+function machOHeader(filePath) {
+  if (!fs.statSync(filePath).isFile()) return { kind: null, filetype: null };
   const fd = fs.openSync(filePath, 'r');
-  const header = Buffer.alloc(4);
-  const read = fs.readSync(fd, header, 0, 4, 0);
+  const header = Buffer.alloc(16);
+  const read = fs.readSync(fd, header, 0, 16, 0);
   fs.closeSync(fd);
-  if (read < 4) return null;
+  if (read < 4) return { kind: null, filetype: null };
   const be = header.readUInt32BE(0);
-  if ([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe].includes(be)) return 'thin';
-  if (be === 0xcafebabe || be === 0xcafebabf) return 'fat';
-  return null;
+  if (be === 0xcafebabe || be === 0xcafebabf) return { kind: 'fat', filetype: null };
+  const littleEndian = be === 0xcefaedfe || be === 0xcffaedfe;
+  if (!littleEndian && be !== 0xfeedface && be !== 0xfeedfacf) return { kind: null, filetype: null };
+  if (read < 16) return { kind: null, filetype: null };
+  const code = littleEndian ? header.readUInt32LE(12) : header.readUInt32BE(12);
+  return { kind: 'thin', filetype: MACHO_FILETYPES[code] || `filetype ${code}` };
 }
 
 const DYLIB_COMMANDS = new Set([
@@ -170,12 +181,12 @@ function parseLoadCommands(text) {
 }
 
 function inspectMachO(filePath) {
-  const kind = machOKind(filePath);
+  const { kind, filetype } = machOHeader(filePath);
   if (!kind) throw new Error(`${filePath} is not a Mach-O file`);
   const archs = run('lipo', ['-archs', filePath]).trim().split(/\s+/).filter(Boolean);
   // Fat files are reported but never parsed further; the contract rejects them.
   const commands = kind === 'thin' ? parseLoadCommands(run('otool', ['-l', filePath])) : parseLoadCommands('');
-  return { kind, archs, ...commands };
+  return { kind, filetype, archs, ...commands };
 }
 
 /** Contract errors for one Mach-O (architecture, slice layout, minimum OS). */
@@ -210,29 +221,42 @@ function expandLoaderTokens(value, loaderDir, executableDir) {
   return value;
 }
 
-/** Candidate on-disk paths dyld would try for an install name. */
-function candidatePaths(installName, { loaderPath, executableDir, rpaths }) {
+/**
+ * Candidate on-disk paths dyld would try for an install name. `rpaths` are the image's own
+ * LC_RPATHs (expanded against the image); `inheritedDirs` are the already-expanded run paths of
+ * the images that loaded it, nearest loader first.
+ */
+function candidatePaths(installName, { loaderPath, executableDir, rpaths, inheritedDirs = [] }) {
   const loaderDir = path.dirname(loaderPath);
   if (installName.startsWith('@rpath/')) {
     const rest = installName.slice('@rpath/'.length);
-    return rpaths
-      .map((rpath) => expandLoaderTokens(rpath, loaderDir, executableDir))
-      .filter(Boolean)
-      .map((dir) => path.join(dir, rest));
+    return [...expandRpaths(rpaths, loaderDir, executableDir), ...inheritedDirs].map((dir) => path.join(dir, rest));
   }
   const expanded = expandLoaderTokens(installName, loaderDir, executableDir);
   return expanded ? [expanded] : [];
+}
+
+/** Expands one image's LC_RPATHs against that image; @executable_path entries need an executable context. */
+function expandRpaths(rpaths, loaderDir, executableDir) {
+  return rpaths.map((rpath) => expandLoaderTokens(rpath, loaderDir, executableDir)).filter(Boolean);
 }
 
 /**
  * Walks every non-system dependency of the roots (executables, plugins, scanner),
  * keyed by realpath so Cellar/opt aliases and cycles collapse to one bundled copy.
  * roots: [{ source, dest, executable }] with dest relative to the bundle root.
+ *
+ * Resolution follows dyld's load context: @rpath searches the image's own LC_RPATHs, then those of
+ * each image that loaded it back to the root; @loader_path is the image containing the command;
+ * @executable_path is the root executable's directory. Plugins are dlopened by a loader we cannot
+ * see at build time, so they only get their own run paths and no @executable_path. An image reached
+ * through several load chains is resolved in each one, and every chain must agree.
  */
 function collectClosure(roots, { inspect = inspectMachO, minMacOS } = {}) {
   const byReal = new Map();
   const byDest = new Map();
   const inspected = new Map();
+  const visitedContexts = new Map();
   const queue = [];
   const errors = [];
   const inspectOnce = (real) => {
@@ -240,28 +264,38 @@ function collectClosure(roots, { inspect = inspectMachO, minMacOS } = {}) {
     return inspected.get(real);
   };
 
-  function register(real, dest, executableDir, root) {
+  function register(real, dest, root) {
     const owner = byDest.get(dest);
     if (owner && owner.real !== real) {
       throw new Error(`Bundle name collision at ${dest}: ${owner.real} and ${real}`);
     }
     if (byReal.has(real)) return byReal.get(real);
-    const entry = { real, dest, executableDir, root, info: inspectOnce(real), deps: [] };
+    const entry = { real, dest, root, info: inspectOnce(real), deps: [], depTargets: new Map() };
     errors.push(...contractErrors(entry.dest, entry.info, minMacOS));
     byReal.set(real, entry);
     byDest.set(dest, entry);
-    queue.push(entry);
     return entry;
+  }
+
+  function visit(entry, inheritedDirs, executableDir, chain) {
+    const key = JSON.stringify([executableDir, inheritedDirs]);
+    if (!visitedContexts.has(entry.real)) visitedContexts.set(entry.real, new Set());
+    if (visitedContexts.get(entry.real).has(key)) return;
+    visitedContexts.get(entry.real).add(key);
+    queue.push({ entry, inheritedDirs, executableDir, chain });
   }
 
   for (const root of roots) {
     if (!fs.existsSync(root.source)) throw new Error(`Required input missing: ${root.source}`);
     const real = fs.realpathSync(root.source);
-    register(real, root.dest, root.executable ? path.dirname(real) : null, root);
+    visit(register(real, root.dest, root), [], root.executable ? path.dirname(real) : null, new Set());
   }
 
   while (queue.length > 0) {
-    const entry = queue.shift();
+    const { entry, inheritedDirs, executableDir, chain } = queue.shift();
+    const ownDirs = expandRpaths(entry.info.rpaths, path.dirname(entry.real), executableDir);
+    const childDirs = [...new Set([...ownDirs, ...inheritedDirs])];
+    const childChain = new Set(chain).add(entry.real);
     for (const dep of entry.info.deps) {
       if (isSystemPath(dep.name)) continue;
       if (dep.name.includes('.framework/')) {
@@ -269,20 +303,26 @@ function collectClosure(roots, { inspect = inspectMachO, minMacOS } = {}) {
       }
       const found = candidatePaths(dep.name, {
         loaderPath: entry.real,
-        executableDir: entry.executableDir,
+        executableDir,
         rpaths: entry.info.rpaths,
+        inheritedDirs,
       }).find((candidate) => fs.existsSync(candidate));
       if (!found) {
         throw new Error(`${entry.dest}: unresolved dependency ${dep.name}`);
       }
       const depReal = fs.realpathSync(found);
-      let target = byReal.get(depReal);
-      if (!target) {
-        const depInfo = inspectOnce(depReal);
-        const base = path.basename(depInfo.id || dep.name);
-        target = register(depReal, `${BRIDGE_LAYOUT.libDir}/${base}`, entry.executableDir, null);
+      const target = byReal.get(depReal)
+        || register(depReal, `${BRIDGE_LAYOUT.libDir}/${path.basename(inspectOnce(depReal).id || dep.name)}`, null);
+      const previous = entry.depTargets.get(dep.name);
+      if (previous && previous !== target) {
+        throw new Error(`${entry.dest}: ${dep.name} resolves to different files depending on load context (${previous.real} and ${target.real})`);
       }
-      entry.deps.push({ name: dep.name, target });
+      if (!previous) {
+        entry.depTargets.set(dep.name, target);
+        entry.deps.push({ name: dep.name, target });
+      }
+      // An image already loaded higher in this chain is not loaded again (dyld reuses it).
+      if (!childChain.has(depReal)) visit(target, childDirs, executableDir, childChain);
     }
   }
 
@@ -476,6 +516,7 @@ module.exports = {
   isSystemPath,
   kegForPath,
   listFiles,
+  machOHeader,
   machOKind,
   materializeClosure,
   parseLoadCommands,

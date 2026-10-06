@@ -6,11 +6,13 @@ const { execFileSync } = require('node:child_process');
 const { after, before, describe, test } = require('node:test');
 const AdmZip = require('adm-zip');
 
-const { addPlugin, buildFixture, clang, makeKeg, writeSource } = require('./fixtures');
+const { FIXTURE_COMPANION, addPlugin, buildFixture, clang, makeKeg, rebuildBinary, writeSource } = require('./fixtures');
 const { packageBridge } = require('../../uxplay/scripts/package-uxplay-macos');
 const { bundleMacosCompanion } = require('../../scripts/bundle-macos-companion');
 const { buildUxPlay, parseBuildJobs, verifyArchive } = require('../../uxplay/scripts/download-and-build-uxplay-macos');
-const { validateBridgeDir, validateZip } = require('../../uxplay/scripts/validate-macos-package');
+const {
+  validateBridgeDir, validateCompanionDir, validateFfmpeg, validateZip,
+} = require('../../uxplay/scripts/validate-macos-package');
 const {
   parseLoadCommands,
   requireMinMacOS,
@@ -132,6 +134,55 @@ describe('bridge packaging', { skip }, () => {
     });
   });
 
+  test('resolves @rpath through the run paths of the images that loaded it', async (t) => {
+    // libinherit imports @rpath/libgamma.1.dylib but has no LC_RPATH; only the executable does.
+    const fixture = buildFixture(scratch('inherited'));
+    const keg = makeKeg(fixture.prefix, 'inherit', '1.0');
+    const inherit = path.join(keg, 'lib', 'libinherit.1.dylib');
+    clang(['-dynamiclib', writeSource(fixture.src, 'inherit.c', 'int gamma_v(void); int inherited(void){return gamma_v();}'),
+      fixture.gamma, '-install_name', inherit, '-o', inherit]);
+    assert.deepEqual(execFileSync('otool', ['-l', inherit], { encoding: 'utf8' }).includes('LC_RPATH'), false);
+    rebuildBinary(fixture, '#include <string.h>\nint inherited(void); int alpha_all(void);\n'
+      + 'int main(int c,char**v){return (c>1&&!strcmp(v[1],"-h")&&inherited()==3&&alpha_all()==5)?0:2;}',
+    [inherit, fixture.optAlpha, `-Wl,-rpath,${path.dirname(fixture.gamma)}`]);
+    // dyld itself accepts this layout.
+    execFileSync(fixture.binary, ['-h'], { env: { PATH: '/usr/bin:/bin' } });
+
+    await t.test('from the executable', () => {
+      const options = fixture.packageOptions();
+      const result = packageBridge(options);
+      assert.ok(result.provenance.files['lib/libinherit.1.dylib']);
+      assert.equal(Object.keys(result.provenance.files).filter((rel) => rel.endsWith('libgamma.1.dylib')).length, 1);
+      validateZip(options.outputZip, { runtime: true, gstProbe: false, requiredPlugins: PLUGINS });
+    });
+
+    await t.test('but not for a plugin whose loader is unknown', () => {
+      addPlugin(fixture, 'libgstinherit.dylib', { extraArgs: [inherit] });
+      const options = fixture.packageOptions({ requiredPlugins: [...PLUGINS, 'libgstinherit.dylib'] });
+      assert.throws(() => packageBridge(options), /lib\/libinherit\.1\.dylib: unresolved dependency @rpath\/libgamma\.1\.dylib/);
+      assertNoArtifact(options);
+    });
+  });
+
+  test('rejects a library whose @rpath dependency differs between load contexts', () => {
+    // The executable's run path finds dupx's libdup, the scanner's finds dupy's.
+    const fixture = buildFixture(scratch('contexts'));
+    const [dupx, dupy] = ['dupx', 'dupy'].map((formula) => {
+      const keg = makeKeg(fixture.prefix, formula, '1.0');
+      const lib = path.join(keg, 'lib', 'libdup.1.dylib');
+      clang(['-dynamiclib', writeSource(fixture.src, `${formula}.c`, 'int dup(void){return 0;}'), '-install_name', '@rpath/libdup.1.dylib', '-o', lib]);
+      return lib;
+    });
+    const sharedKeg = makeKeg(fixture.prefix, 'shared', '1.0');
+    const shared = path.join(sharedKeg, 'lib', 'libshared.1.dylib');
+    clang(['-dynamiclib', writeSource(fixture.src, 'shared.c', 'int dup(void); int shared(void){return dup();}'), dupx, '-install_name', shared, '-o', shared]);
+    rebuildBinary(fixture, 'int shared(void); int main(void){return shared();}', [shared, `-Wl,-rpath,${path.dirname(dupx)}`]);
+    clang([writeSource(fixture.src, 'scanner2.c', 'int shared(void); int main(void){return shared();}'), shared, `-Wl,-rpath,${path.dirname(dupy)}`, '-o', fixture.scanner]);
+    const options = fixture.packageOptions();
+    assert.throws(() => packageBridge(options), /Bundle name collision at lib\/libdup\.1\.dylib|different files depending on load context/);
+    assertNoArtifact(options);
+  });
+
   test('failed or interrupted packaging never leaves a final artifact', () => {
     const fixture = buildFixture(scratch('interrupted'));
     const options = fixture.packageOptions();
@@ -221,6 +272,66 @@ describe('bridge validation', { skip }, () => {
     assert.throws(() => validate(dir), /lib\/libbeta\.2\.dylib does not match its recorded sha256[\s\S]*code signature invalid/);
   });
 
+  // Replaces files and records their new hashes, so inventory checks cannot mask the real error.
+  function substitute(dir, replacements) {
+    const provenancePath = path.join(dir, 'provenance.json');
+    const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+    for (const [rel, write] of Object.entries(replacements)) {
+      const target = path.join(dir, rel);
+      const mode = fs.statSync(target).mode & 0o777;
+      fs.rmSync(target);
+      delete provenance.files[rel];
+      write(target);
+      if (fs.statSync(target).isDirectory()) {
+        for (const name of fs.readdirSync(target)) {
+          provenance.files[`${rel}/${name}`] = { sha256: sha256File(path.join(target, name)), origin: 'test' };
+        }
+      } else {
+        fs.chmodSync(target, mode);
+        provenance.files[rel] = { sha256: sha256File(target), origin: 'test' };
+      }
+    }
+    fs.writeFileSync(provenancePath, JSON.stringify(provenance));
+  }
+  const text = (target) => fs.writeFileSync(target, 'not Mach-O\n');
+
+  test('rejects text, directory or wrong-type stand-ins for required images', async (t) => {
+    await t.test('text receiver, scanner and plugin (modes kept, inventory updated)', () => {
+      const dir = extracted();
+      substitute(dir, {
+        'echo-airplay': text,
+        'libexec/gstreamer-1.0/gst-plugin-scanner': text,
+        'lib/gstreamer-1.0/libgstfake.dylib': text,
+      });
+      assert.equal(fs.statSync(path.join(dir, 'echo-airplay')).mode & 0o777, 0o755);
+      assert.throws(() => validate(dir), (e) => {
+        assert.match(e.message, /echo-airplay is not a Mach-O image[\s\S]*gst-plugin-scanner is not a Mach-O image[\s\S]*libgstfake\.dylib is not a Mach-O image/);
+        assert.doesNotMatch(e.message, /recorded sha256|not listed in the inventory/);
+        return true;
+      });
+    });
+
+    await t.test('plugin replaced by a directory', () => {
+      const dir = extracted();
+      substitute(dir, {
+        'lib/gstreamer-1.0/libgstfake.dylib': (target) => { fs.mkdirSync(target); text(path.join(target, 'payload')); },
+      });
+      assert.throws(() => validate(dir), /lib\/gstreamer-1\.0\/libgstfake\.dylib is not a regular file/);
+    });
+
+    await t.test('receiver replaced by a signed arm64 dylib', () => {
+      const dir = extracted();
+      substitute(dir, { 'echo-airplay': (target) => fs.copyFileSync(path.join(dir, 'lib', 'libbeta.2.dylib'), target) });
+      assert.throws(() => validate(dir), /echo-airplay is a Mach-O dylib, expected execute/);
+    });
+
+    await t.test('bundled dependency replaced by text', () => {
+      const dir = extracted();
+      substitute(dir, { 'lib/libgamma.1.dylib': text });
+      assert.throws(() => validate(dir), /dependency @rpath\/libgamma\.1\.dylib resolves to a file that is not a Mach-O dylib/);
+    });
+  });
+
   test('rejects symlinks inside the bundle', () => {
     const dir = extracted();
     fs.symlinkSync('/opt/homebrew/lib', path.join(dir, 'lib', 'homebrew'));
@@ -246,7 +357,7 @@ describe('companion bundle', { skip }, () => {
       minMacOS: '13.0',
       requiredPlugins: PLUGINS,
       gstProbe: false,
-      companion: { commit: 'fixture', dirty: false },
+      companion: FIXTURE_COMPANION,
       ...extra,
     };
   }
@@ -266,6 +377,151 @@ describe('companion bundle', { skip }, () => {
     assert.equal(result.kind, 'companion');
   });
 
+  test('records the bundling and bridge companion revisions separately', () => {
+    // A bridge packaged at one companion revision may be bundled at another; each phase keeps its own record.
+    const bundler = { commit: 'a'.repeat(40), dirty: false };
+    const options = bundleOptions({ companion: bundler });
+    const { summary } = bundleMacosCompanion(options);
+    assert.deepEqual(summary.companion, bundler);
+    assert.equal(summary.airplayBridge.archiveSha256, sha256File(bridgeZip));
+    assert.equal(summary.uxplay.commit, '21eef8df25d91e12635c36d8176ad192725baca2');
+
+    const root = path.join(scratch('phases'), 'out');
+    safeExtractZip(options.outputZip, root);
+    const nestedPath = path.join(root, 'echo-ios-dependencies-macos', 'airplay-bridge', 'provenance.json');
+    const nested = JSON.parse(fs.readFileSync(nestedPath, 'utf8'));
+    assert.deepEqual(nested.companion, FIXTURE_COMPANION);
+    assert.equal(summary.files['airplay-bridge/provenance.json'], sha256File(nestedPath));
+
+    // The bridge's own record cannot be rewritten to credit the bundling revision.
+    nested.companion = bundler;
+    fs.writeFileSync(nestedPath, JSON.stringify(nested));
+    assert.throws(() => validateCompanionDir(path.dirname(path.dirname(nestedPath)), { requiredPlugins: PLUGINS }),
+      /airplay-bridge\/provenance\.json does not match its recorded sha256/);
+  });
+
+  test('rejects an unsigned ffmpeg', () => {
+    const ffmpegDir = scratch('unsigned-ffmpeg');
+    for (const name of ['ffmpeg', 'LICENSE', 'ffmpeg.LICENSE']) fs.copyFileSync(path.join(fixture.ffmpegDir, name), path.join(ffmpegDir, name));
+    execFileSync('codesign', ['--remove-signature', path.join(ffmpegDir, 'ffmpeg')], { stdio: 'pipe' });
+    const options = bundleOptions({ ffmpegDir });
+    assert.throws(() => bundleMacosCompanion(options), /ffmpeg: code signature invalid/);
+    assertNoArtifact(options);
+  });
+
+  test('accepts the checked-in ffmpeg without executing it', () => {
+    const info = validateFfmpeg(path.join(__dirname, '..', '..', 'ffmpeg', 'ffmpeg'), '26.0');
+    assert.deepEqual(info.archs, ['arm64']);
+  });
+
+  test('rejects an ffmpeg without its license notices', () => {
+    const ffmpegDir = scratch('ffmpeg-no-notice');
+    fs.copyFileSync(path.join(fixture.ffmpegDir, 'ffmpeg'), path.join(ffmpegDir, 'ffmpeg'));
+    fs.copyFileSync(path.join(fixture.ffmpegDir, 'LICENSE'), path.join(ffmpegDir, 'LICENSE'));
+    const options = bundleOptions({ ffmpegDir });
+    assert.throws(() => bundleMacosCompanion(options), /Required ffmpeg license notice ffmpeg\.LICENSE not found/);
+    assertNoArtifact(options);
+  });
+
+  test('final validation checks notices, provenance agreement and execute permissions', async (t) => {
+    const options = bundleOptions();
+    bundleMacosCompanion(options);
+    const extract = () => {
+      const dir = scratch('final');
+      safeExtractZip(options.outputZip, dir);
+      return path.join(dir, 'echo-ios-dependencies-macos');
+    };
+    const editManifest = (root, edit) => {
+      const manifestPath = path.join(root, 'manifest.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      edit(manifest);
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    };
+    const validate = (root) => validateCompanionDir(root, { requiredPlugins: PLUGINS });
+
+    await t.test('missing ffmpeg notice, even when removed from the inventory', () => {
+      const root = extract();
+      fs.rmSync(path.join(root, 'ffmpeg', 'ffmpeg.LICENSE'));
+      editManifest(root, (manifest) => { delete manifest.files['ffmpeg/ffmpeg.LICENSE']; });
+      assert.throws(() => validate(root), /license file ffmpeg\/ffmpeg\.LICENSE is missing/);
+    });
+
+    await t.test('manifest that rewrites a bridge component or drops a release gap', () => {
+      const root = extract();
+      editManifest(root, (manifest) => {
+        manifest.components.find((component) => component.name === 'alpha').license = 'MIT';
+        manifest.releaseGaps = manifest.releaseGaps.slice(1);
+      });
+      assert.throws(() => validate(root), /Manifest component alpha 1\.0 differs from bridge provenance[\s\S]*Manifest drops bridge release gap/);
+    });
+
+    await t.test('ffmpeg whose signature was removed (inventory updated)', () => {
+      const root = extract();
+      const ffmpegPath = path.join(root, 'ffmpeg', 'ffmpeg');
+      execFileSync('codesign', ['--remove-signature', ffmpegPath], { stdio: 'pipe' });
+      editManifest(root, (manifest) => {
+        manifest.files['ffmpeg/ffmpeg'] = sha256File(ffmpegPath);
+        manifest.ffmpeg.sha256 = sha256File(ffmpegPath);
+      });
+      assert.throws(() => validate(root), (e) => {
+        assert.match(e.message, /ffmpeg: code signature invalid/);
+        assert.doesNotMatch(e.message, /recorded sha256|does not match the bundled ffmpeg/);
+        return true;
+      });
+    });
+
+    await t.test('ffmpeg replaced by a dylib', () => {
+      const root = extract();
+      const ffmpegPath = path.join(root, 'ffmpeg', 'ffmpeg');
+      fs.copyFileSync(path.join(root, 'airplay-bridge', 'lib', 'libbeta.2.dylib'), ffmpegPath);
+      fs.chmodSync(ffmpegPath, 0o755);
+      editManifest(root, (manifest) => {
+        manifest.files['ffmpeg/ffmpeg'] = sha256File(ffmpegPath);
+        manifest.ffmpeg.sha256 = sha256File(ffmpegPath);
+      });
+      assert.throws(() => validate(root), /is not a Mach-O executable/);
+    });
+
+    await t.test('ffmpeg or scanner without execute permission, including in a downloaded zip', () => {
+      const root = extract();
+      fs.chmodSync(path.join(root, 'ffmpeg', 'ffmpeg'), 0o644);
+      fs.chmodSync(path.join(root, 'airplay-bridge', 'libexec', 'gstreamer-1.0', 'gst-plugin-scanner'), 0o644);
+      assert.throws(() => validate(root), /libexec\/gstreamer-1\.0\/gst-plugin-scanner is not executable \(mode 0644\)[\s\S]*ffmpeg: ffmpeg is not executable \(mode 0644\)/);
+      const rezipped = path.join(path.dirname(root), 'tampered.zip');
+      execFileSync('zip', ['-r', '-X', '-q', rezipped, 'echo-ios-dependencies-macos'], { cwd: path.dirname(root) });
+      assert.throws(() => validateZip(rezipped, { requiredPlugins: PLUGINS }), /ffmpeg: ffmpeg is not executable/);
+    });
+  });
+
+  test('a failure while publishing leaves no final zip or sidecar', async (t) => {
+    const injected = [
+      ['writing the sidecar (ENOSPC)', 'writeFileSync', (file) => file.endsWith('.manifest.json.partial')],
+      ['renaming the sidecar into place', 'renameSync', (from) => from.endsWith('.manifest.json.partial')],
+      ['renaming the zip into place', 'renameSync', (from) => from.endsWith('.zip.partial')],
+    ];
+    for (const [label, method, matches] of injected) {
+      await t.test(label, () => {
+        const options = bundleOptions();
+        const original = fs[method];
+        fs[method] = function failing(file, ...args) {
+          if (typeof file === 'string' && matches(file)) {
+            throw Object.assign(new Error(`injected failure ${label}`), { code: 'ENOSPC' });
+          }
+          return original.call(this, file, ...args);
+        };
+        try {
+          assert.throws(() => bundleMacosCompanion(options), /injected failure/);
+        } finally {
+          fs[method] = original;
+        }
+        const sidecar = options.outputZip.replace(/\.zip$/, '.manifest.json');
+        for (const output of [options.outputZip, `${options.outputZip}.partial`, sidecar, `${sidecar}.partial`]) {
+          assert.equal(fs.existsSync(output), false, `${path.basename(output)} must not remain`);
+        }
+      });
+    }
+  });
+
   test('rejects a missing ffmpeg', () => {
     const options = bundleOptions({ ffmpegDir: scratch('no-ffmpeg') });
     assert.throws(() => bundleMacosCompanion(options), /ffmpeg binary not found/);
@@ -275,6 +531,7 @@ describe('companion bundle', { skip }, () => {
   test('rejects an Intel ffmpeg instead of mislabeling the bundle', () => {
     const ffmpegDir = scratch('intel-ffmpeg');
     clang([writeSource(ffmpegDir, 'f.c', 'int main(void){return 0;}'), '-o', path.join(ffmpegDir, 'ffmpeg')], { arch: ['x86_64'] });
+    for (const notice of ['LICENSE', 'ffmpeg.LICENSE']) fs.copyFileSync(path.join(fixture.ffmpegDir, notice), path.join(ffmpegDir, notice));
     const options = bundleOptions({ ffmpegDir });
     assert.throws(() => bundleMacosCompanion(options), /ffmpeg: architecture x86_64 does not match contract arm64/);
     assertNoArtifact(options);

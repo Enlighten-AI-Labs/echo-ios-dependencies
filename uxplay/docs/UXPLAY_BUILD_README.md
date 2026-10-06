@@ -4,17 +4,33 @@ This repository builds and packages the UxPlay-based AirPlay bridge as a separat
 
 ## macOS
 
-`npm run build:macos` runs three steps. Each one fails closed and removes its previous output before it starts, so a failed or interrupted run never leaves an artifact that looks complete.
+`npm run build:macos` runs three steps. Each step removes its previous outputs, and everything downstream of them, before it starts. If a step fails with an error, it also removes anything it wrote, so a failed command never leaves a final zip or sidecar behind.
 
 1. `build:macos:uxplay`: downloads (or reads from `UXPLAY_SOURCE_ARCHIVE`) the pinned UxPlay 1.73.6 source archive (commit `21eef8df25d91e12635c36d8176ad192725baca2`) and checks its sha256 before a bounded, path-checked extraction. It then builds thin arm64 with the selected deployment target and writes `uxplay/resources/temp/uxplay-build/build-info.json`.
-2. `package:macos:uxplay`: collects the full recursive dylib closure of the binary, the curated GStreamer plugins and `gst-plugin-scanner`. It then:
+2. `package:macos:uxplay`: collects the full recursive dylib closure of the binary, the curated GStreamer plugins and `gst-plugin-scanner`. `@rpath` is resolved the way dyld does, including run paths inherited from the executable that loads a library. Plugins only get their own run paths, because their loader isn't known at build time. It then:
    - rewrites every install name to `@rpath` with relative rpaths
    - ad-hoc signs the copied files
    - writes license texts, `THIRD_PARTY_NOTICES.md` and `provenance.json` (UxPlay commit, per-component source URL and sha256, per-file sha256, release gaps)
    - validates the result and writes `uxplay/resources/temp/airplay-bridge.zip`
-3. `bundle:macos`: validates the bridge and the unchanged checked-in `ffmpeg`, then assembles `dist/echo-ios-dependencies-macos.zip`. It validates the final zip, including an offline relocated runtime check, before renaming it into place. It also writes `dist/echo-ios-dependencies-macos.manifest.json` with the final zip sha256.
+3. `bundle:macos`: validates the bridge and the unchanged checked-in `ffmpeg`, then assembles `dist/echo-ios-dependencies-macos.zip`. `ffmpeg/LICENSE` and `ffmpeg/ffmpeg.LICENSE` are required. It validates the final zip, including an offline relocated runtime check. It then writes `dist/echo-ios-dependencies-macos.manifest.json` with the final zip sha256, and only after that renames the zip into place.
 
-`npm run validate:macos` re-runs the full validation on `dist/echo-ios-dependencies-macos.zip`. `npm test` covers the packaging and validation rules with small compiled fixtures.
+If the process is killed outright (for example SIGKILL or power loss), cleanup code can't run. Outputs are written as `*.partial` files and renamed into place, so a killed run can leave `*.partial` files, or a sidecar manifest without its zip. It can't leave a final zip without its sidecar. The next run removes all of these before it starts.
+
+`npm run validate:macos` re-runs the full validation on `dist/echo-ios-dependencies-macos.zip`. Besides checking every file hash, it requires:
+- each component's license notices to be present
+- the manifest to match the bridge's `provenance.json` (components, UxPlay source, release gaps)
+- `echo-airplay`, the plugin scanner, the wrapper and `ffmpeg` to be executable
+- `echo-airplay`, the scanner and `ffmpeg` to be Mach-O executables, and the required plugins and bundled libraries to be Mach-O libraries
+- valid code signatures on every bundled Mach-O file and on `ffmpeg` (checked statically with `codesign --verify --strict`; `ffmpeg` itself is never run)
+
+Source attribution is recorded per step:
+- the bridge's `provenance.json` records the companion commit it was packaged from
+- `manifest.json` records the companion commit that bundled it
+- both record the pinned UxPlay source commit and archive hash
+
+`npm run build:macos` rebuilds every step from the same checkout, so the two commits match. Bundling a previously packaged bridge keeps the bridge's own record unchanged, with its hash in the manifest. Release evidence should come from a fresh full pipeline at the exact release commit.
+
+`npm test` covers the packaging and validation rules with small compiled fixtures.
 
 ### Support contract
 

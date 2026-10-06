@@ -22,6 +22,7 @@ const {
   inspectMachO,
   isSystemPath,
   listFiles,
+  machOHeader,
   machOKind,
   requireMinMacOS,
   run,
@@ -30,6 +31,8 @@ const {
 } = require('./macos-gstreamer-runtime');
 
 const COMPANION_DIR = 'echo-ios-dependencies-macos';
+const FFMPEG_COMPONENT = 'ffmpeg (prebuilt)';
+const BRIDGE_EXECUTABLES = [BRIDGE_LAYOUT.executable, BRIDGE_LAYOUT.scanner, 'echo-airplay-wrapper.sh'];
 const PROBE_SOURCE = path.join(__dirname, 'macos-gst-probe.c');
 
 class ValidationError extends Error {
@@ -47,6 +50,38 @@ function insideDir(candidate, dir) {
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+/**
+ * Required images must be regular thin Mach-O files of the expected type, checked before the
+ * architecture/minimum-OS/signature checks (which only see files that already look like Mach-O).
+ */
+function requiredImageErrors(rootDir, expectations) {
+  const errors = [];
+  for (const [rel, types] of expectations) {
+    const filePath = path.join(rootDir, rel);
+    if (!fs.existsSync(filePath)) continue;
+    if (!fs.lstatSync(filePath).isFile()) {
+      errors.push(`${rel} is not a regular file`);
+      continue;
+    }
+    const { kind, filetype } = machOHeader(filePath);
+    if (!kind) errors.push(`${rel} is not a Mach-O image`);
+    else if (kind === 'thin' && !types.includes(filetype)) errors.push(`${rel} is a Mach-O ${filetype}, expected ${types.join(' or ')}`);
+  }
+  return errors;
+}
+
+/** Hashes cover bytes only, so launchable files also need their execute bits (u, g and o). */
+function executableModeErrors(rootDir, rels) {
+  const errors = [];
+  for (const rel of rels) {
+    const filePath = path.join(rootDir, rel);
+    if (!fs.existsSync(filePath)) continue;
+    const mode = fs.statSync(filePath).mode & 0o777;
+    if ((mode & 0o111) !== 0o111) errors.push(`${rel} is not executable (mode ${mode.toString(8).padStart(4, '0')})`);
+  }
+  return errors;
 }
 
 /** Compares a recorded {relPath: sha256} map with the files actually present. */
@@ -87,6 +122,7 @@ function loadCommandErrors(bridgeDir, rel, info) {
     const found = candidatePaths(dep.name, { loaderPath: filePath, executableDir: null, rpaths: inBundleRpaths })
       .find((candidate) => insideDir(candidate, bridgeDir) && fs.existsSync(candidate));
     if (!found) errors.push(`${rel}: dependency ${dep.name} does not resolve inside the bundle`);
+    else if (machOHeader(found).filetype !== 'dylib') errors.push(`${rel}: dependency ${dep.name} resolves to a file that is not a Mach-O dylib`);
   }
   return errors;
 }
@@ -105,6 +141,12 @@ function validateBridgeDir(bridgeDir, { requiredPlugins = REQUIRED_PLUGINS, expe
   for (const plugin of requiredPlugins) {
     if (!fs.existsSync(at(`${BRIDGE_LAYOUT.pluginDir}/${plugin}`))) errors.push(`Missing required plugin ${plugin}`);
   }
+  errors.push(...executableModeErrors(bridgeDir, BRIDGE_EXECUTABLES));
+  errors.push(...requiredImageErrors(bridgeDir, [
+    [BRIDGE_LAYOUT.executable, ['execute']],
+    [BRIDGE_LAYOUT.scanner, ['execute']],
+    ...requiredPlugins.map((plugin) => [`${BRIDGE_LAYOUT.pluginDir}/${plugin}`, ['dylib', 'bundle']]),
+  ]));
   if (!fs.existsSync(at(BRIDGE_LAYOUT.provenance))) {
     errors.push('Missing provenance.json (stale or binary-only archive)');
     throw new ValidationError(`Bridge ${bridgeDir}`, errors);
@@ -167,9 +209,16 @@ function validateBridgeDir(bridgeDir, { requiredPlugins = REQUIRED_PLUGINS, expe
 /** ffmpeg is shipped unchanged; it must still satisfy the same architecture/OS contract. */
 function validateFfmpeg(ffmpegPath, minMacOS) {
   if (!fs.existsSync(ffmpegPath)) throw new ValidationError('ffmpeg', [`ffmpeg binary not found at ${ffmpegPath}`]);
-  if (!machOKind(ffmpegPath)) throw new ValidationError('ffmpeg', [`${ffmpegPath} is not a Mach-O executable`]);
+  const header = machOHeader(ffmpegPath);
+  if (!header.kind || (header.kind === 'thin' && header.filetype !== 'execute')) {
+    throw new ValidationError('ffmpeg', [`${ffmpegPath} is not a Mach-O executable`]);
+  }
   const info = inspectMachO(ffmpegPath);
   const errors = contractErrors('ffmpeg', info, minMacOS);
+  errors.push(...executableModeErrors(path.dirname(ffmpegPath), ['ffmpeg']).map((error) => `ffmpeg: ${error}`));
+  // Static check only; ffmpeg is never executed. arm64 macOS kills unsigned or tampered code at launch.
+  const verify = spawnSync('codesign', ['--verify', '--strict', ffmpegPath], { encoding: 'utf8' });
+  if (verify.status !== 0) errors.push(`ffmpeg: code signature invalid (${verify.stderr.trim()})`);
   for (const dep of info.deps) {
     if (!isSystemPath(dep.name)) errors.push(`ffmpeg: dependency ${dep.name} is not a system library`);
   }
@@ -207,9 +256,55 @@ function validateCompanionDir(packageRoot, { requiredPlugins, expectedMinMacOS =
   if (manifest.buildKind === 'release-candidate' && (manifest.releaseGaps || []).length > 0) {
     errors.push(`Release candidate has unresolved release gaps: ${manifest.releaseGaps.join('; ')}`);
   }
+  if (provenance) errors.push(...manifestProvenanceErrors(manifest, provenance));
+  errors.push(...componentNoticeErrors(packageRoot, manifest));
+  const ffmpegPath = path.join(packageRoot, 'ffmpeg', 'ffmpeg');
+  if (fs.existsSync(ffmpegPath) && (manifest.ffmpeg || {}).sha256 !== sha256File(ffmpegPath)) {
+    errors.push('Manifest ffmpeg sha256 does not match the bundled ffmpeg');
+  }
   errors.push(...inventoryErrors(packageRoot, manifest.files || {}, ['manifest.json']));
   if (errors.length > 0) throw new ValidationError(`Companion bundle ${packageRoot}`, errors);
   return manifest;
+}
+
+/** Every manifest component (bridge components and ffmpeg) must point at notices that exist. */
+function componentNoticeErrors(packageRoot, manifest) {
+  const errors = [];
+  const components = manifest.components || [];
+  if (!components.some((component) => component.name === FFMPEG_COMPONENT)) {
+    errors.push(`Manifest has no ${FFMPEG_COMPONENT} component`);
+  }
+  for (const component of components) {
+    const files = component.licenseFiles || [];
+    if (files.length === 0) errors.push(`Component ${component.name} has no license notice`);
+    for (const rel of files) {
+      const filePath = path.join(packageRoot, rel);
+      if (!insideDir(filePath, packageRoot) || !fs.existsSync(filePath)) {
+        errors.push(`Component ${component.name} license file ${rel} is missing`);
+      }
+    }
+  }
+  return errors;
+}
+
+/** The final manifest must restate the bridge provenance, not drop or alter it. */
+function manifestProvenanceErrors(manifest, provenance) {
+  const errors = [];
+  if (JSON.stringify(manifest.uxplay) !== JSON.stringify(provenance.uxplay)) {
+    errors.push('Manifest uxplay source differs from bridge provenance');
+  }
+  const listed = new Map((manifest.components || []).map((component) => [`${component.name}@${component.version}`, component]));
+  for (const component of provenance.components || []) {
+    const expected = { ...component, licenseFiles: component.licenseFiles.map((rel) => `airplay-bridge/${rel}`) };
+    const actual = listed.get(`${component.name}@${component.version}`);
+    if (!actual || JSON.stringify(actual) !== JSON.stringify(expected)) {
+      errors.push(`Manifest component ${component.name} ${component.version} differs from bridge provenance`);
+    }
+  }
+  for (const gap of provenance.releaseGaps || []) {
+    if (!(manifest.releaseGaps || []).includes(gap)) errors.push(`Manifest drops bridge release gap: ${gap}`);
+  }
+  return errors;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +476,7 @@ if (require.main === module) {
 
 module.exports = {
   COMPANION_DIR,
+  FFMPEG_COMPONENT,
   ValidationError,
   runRuntimeChecks,
   validateBridgeDir,
