@@ -1,153 +1,212 @@
 #!/usr/bin/env node
 
+// Assembles dist/echo-ios-dependencies-macos.zip from the validated relocatable bridge and the
+// checked-in ffmpeg, then validates the final zip (including a relocated runtime launch) before
+// it is renamed into place. A sidecar manifest records the final artifact sha256.
+
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
-const AdmZip = require('adm-zip');
+const {
+  MACOS_CONTRACT,
+  MIN_MACOS_ENV,
+  hashTree,
+  requireMinMacOS,
+  run,
+  safeExtractZip,
+  sha256File,
+  writeZipAtomically,
+} = require('../uxplay/scripts/macos-gstreamer-runtime');
+const {
+  COMPANION_DIR,
+  validateBridgeDir,
+  validateFfmpeg,
+  validateZip,
+} = require('../uxplay/scripts/validate-macos-package');
 
 const appRoot = path.join(__dirname, '..');
-const uxplayRoot = path.join(appRoot, 'uxplay');
-const ffmpegRoot = path.join(appRoot, 'ffmpeg');
-const distDir = path.join(appRoot, 'dist');
-const tempDir = path.join(appRoot, 'temp', 'macos-companion');
-const uxplayArtifact = path.join(uxplayRoot, 'resources', 'temp', 'airplay-bridge.zip');
-const outputZip = path.join(distDir, 'echo-ios-dependencies-macos.zip');
 
-function ensureFile(filePath, label) {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`${label} not found at ${filePath}`);
-  }
+const DEFAULTS = {
+  bridgeZip: path.join(appRoot, 'uxplay', 'resources', 'temp', 'airplay-bridge.zip'),
+  ffmpegDir: path.join(appRoot, 'ffmpeg'),
+  outputZip: path.join(appRoot, 'dist', 'echo-ios-dependencies-macos.zip'),
+  tempDir: path.join(appRoot, 'temp', 'macos-companion'),
+};
+
+const FFMPEG_FILES = ['ffmpeg', 'LICENSE', 'README.md', 'ffmpeg.LICENSE', 'ffmpeg.README'];
+const FFMPEG_FLAGGED_OPTIONS = ['--enable-nonfree', '--enable-gpl', '--enable-version3'];
+
+function sidecarPath(outputZip) {
+  return outputZip.replace(/\.zip$/, '.manifest.json');
 }
 
-function resetDir(dirPath) {
-  fs.rmSync(dirPath, { recursive: true, force: true });
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function copyIfExists(sourcePath, targetPath) {
-  if (!fs.existsSync(sourcePath)) {
-    return false;
-  }
-
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.copyFileSync(sourcePath, targetPath);
-  return true;
-}
-
-function makeExecutable(filePath) {
+function gitState() {
   try {
-    fs.chmodSync(filePath, 0o755);
+    return {
+      commit: run('git', ['-C', appRoot, 'rev-parse', 'HEAD']).trim(),
+      dirty: run('git', ['-C', appRoot, 'status', '--porcelain']).trim().length > 0,
+    };
   } catch (_error) {
-    // Ignore chmod failures on already-correct files.
+    return { commit: null, dirty: null };
   }
 }
 
-function buildManifest(packageRoot) {
-  const manifest = {
-    generatedAt: new Date().toISOString(),
-    platform: 'darwin',
-    contents: {
-      airplay: [],
-      ffmpeg: [],
+/** ffmpeg ships unchanged; record what is known about it and flag what is not. */
+function describeFfmpeg(ffmpegPath) {
+  const binary = fs.readFileSync(ffmpegPath);
+  const flagged = FFMPEG_FLAGGED_OPTIONS.filter((option) => binary.includes(option));
+  const gaps = ['ffmpeg: checked-in prebuilt binary has no source receipt (exact source/version/build provenance unknown)'];
+  if (flagged.includes('--enable-nonfree')) {
+    gaps.push('ffmpeg: built with --enable-nonfree, which makes the binary non-redistributable under GPL; pre-existing, needs a decision');
+  }
+  return {
+    sha256: sha256File(ffmpegPath),
+    configureOptionsFlagged: flagged,
+    component: {
+      name: 'ffmpeg (prebuilt)',
+      version: 'unknown',
+      license: flagged.includes('--enable-gpl') ? 'GPL (configure flags: see configureOptionsFlagged)' : 'LGPL-2.1-or-later',
+      linkage: 'separate executable',
+      sourceUrl: null,
+      sourceSha256: null,
+      licenseFiles: ['ffmpeg/LICENSE', 'ffmpeg/ffmpeg.LICENSE'],
     },
+    gaps,
   };
+}
 
-  const airplayDir = path.join(packageRoot, 'airplay-bridge');
-  const ffmpegDir = path.join(packageRoot, 'ffmpeg');
+function bundleMacosCompanion(options = {}) {
+  const opts = { ...DEFAULTS, ...options };
+  const sidecar = sidecarPath(opts.outputZip);
+  fs.rmSync(opts.outputZip, { force: true });
+  fs.rmSync(`${opts.outputZip}.partial`, { force: true });
+  fs.rmSync(sidecar, { force: true });
 
-  if (fs.existsSync(airplayDir)) {
-    manifest.contents.airplay = fs.readdirSync(airplayDir).sort();
+  try {
+    const minMacOS = requireMinMacOS(opts.minMacOS);
+    if (!fs.existsSync(opts.bridgeZip)) throw new Error(`Packaged AirPlay bridge not found at ${opts.bridgeZip}`);
+    const ffmpegPath = path.join(opts.ffmpegDir, 'ffmpeg');
+    if (!fs.existsSync(ffmpegPath)) throw new Error(`ffmpeg binary not found at ${ffmpegPath}`);
+
+    fs.rmSync(opts.tempDir, { recursive: true, force: true });
+    const packageRoot = path.join(opts.tempDir, COMPANION_DIR);
+    const airplayDir = path.join(packageRoot, 'airplay-bridge');
+    const ffmpegDir = path.join(packageRoot, 'ffmpeg');
+
+    console.log('[bundle] Extracting and validating the AirPlay bridge...');
+    safeExtractZip(opts.bridgeZip, airplayDir);
+    const provenance = validateBridgeDir(airplayDir, { requiredPlugins: opts.requiredPlugins, expectedMinMacOS: minMacOS });
+    validateFfmpeg(ffmpegPath, minMacOS);
+
+    console.log('[bundle] Copying ffmpeg (unchanged)...');
+    fs.mkdirSync(ffmpegDir, { recursive: true });
+    for (const fileName of FFMPEG_FILES) {
+      const source = path.join(opts.ffmpegDir, fileName);
+      if (!fs.existsSync(source)) continue;
+      fs.copyFileSync(source, path.join(ffmpegDir, fileName));
+      fs.chmodSync(path.join(ffmpegDir, fileName), fileName === 'ffmpeg' ? 0o755 : 0o644);
+    }
+    const ffmpeg = describeFfmpeg(path.join(ffmpegDir, 'ffmpeg'));
+
+    fs.writeFileSync(path.join(packageRoot, 'README.txt'), `Echo iOS Dependencies (macOS)
+
+Supported: Apple silicon (thin ${MACOS_CONTRACT.arch}), macOS ${minMacOS} or newer.
+Build kind: ${provenance.buildKind}
+Intel and universal Macs are not supported by this bundle.
+
+Contents:
+- airplay-bridge/echo-airplay (self-contained: bundled libraries in airplay-bridge/lib,
+  GStreamer plugins in airplay-bridge/lib/gstreamer-1.0, scanner in airplay-bridge/libexec)
+- airplay-bridge/THIRD_PARTY_NOTICES.md, airplay-bridge/licenses/, airplay-bridge/provenance.json
+- ffmpeg/ffmpeg
+- manifest.json (file hashes, components, source commits, release gaps)
+
+Install these as a separately distributed companion runtime. Homebrew is not required.
+`, { mode: 0o644 });
+
+    const components = [
+      ...provenance.components.map((component) => ({
+        ...component,
+        licenseFiles: component.licenseFiles.map((rel) => `airplay-bridge/${rel}`),
+      })),
+      ffmpeg.component,
+    ];
+    const manifest = {
+      schema: 1,
+      generatedAt: new Date().toISOString(),
+      platform: 'darwin',
+      arch: MACOS_CONTRACT.arch,
+      minimumMacOS: minMacOS,
+      buildKind: provenance.buildKind,
+      uxplay: provenance.uxplay,
+      companion: opts.companion || gitState(),
+      airplayBridge: { archiveSha256: sha256File(opts.bridgeZip), provenance: 'airplay-bridge/provenance.json' },
+      ffmpeg: { sha256: ffmpeg.sha256, configureOptionsFlagged: ffmpeg.configureOptionsFlagged },
+      contents: {
+        airplay: fs.readdirSync(airplayDir).sort(),
+        ffmpeg: fs.readdirSync(ffmpegDir).sort(),
+      },
+      components,
+      files: hashTree(packageRoot),
+      releaseGaps: [...provenance.releaseGaps, ...ffmpeg.gaps],
+    };
+    fs.writeFileSync(path.join(packageRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
+
+    console.log('[bundle] Creating and validating the downloadable zip...');
+    const zip = writeZipAtomically(opts.tempDir, opts.outputZip);
+    const validation = validateZip(zip.partial, {
+      runtime: opts.runtime !== false,
+      gstProbe: opts.gstProbe !== false,
+      requiredPlugins: opts.requiredPlugins,
+      expectedMinMacOS: minMacOS,
+    });
+    zip.commit();
+
+    const summary = {
+      artifact: path.basename(opts.outputZip),
+      sha256: sha256File(opts.outputZip),
+      size: fs.statSync(opts.outputZip).size,
+      platform: manifest.platform,
+      arch: manifest.arch,
+      minimumMacOS: manifest.minimumMacOS,
+      buildKind: manifest.buildKind,
+      uxplay: manifest.uxplay,
+      companion: manifest.companion,
+      airplayBridge: manifest.airplayBridge,
+      ffmpeg: manifest.ffmpeg,
+      components: manifest.components,
+      files: manifest.files,
+      releaseGaps: manifest.releaseGaps,
+      runtimeValidation: validation.runtime || null,
+    };
+    fs.writeFileSync(`${sidecar}.partial`, `${JSON.stringify(summary, null, 2)}\n`);
+    fs.renameSync(`${sidecar}.partial`, sidecar);
+    return { outputZip: opts.outputZip, sidecar, summary };
+  } catch (error) {
+    fs.rmSync(`${opts.outputZip}.partial`, { force: true });
+    fs.rmSync(`${sidecar}.partial`, { force: true });
+    throw error;
   }
-  if (fs.existsSync(ffmpegDir)) {
-    manifest.contents.ffmpeg = fs.readdirSync(ffmpegDir).sort();
-  }
-
-  fs.writeFileSync(
-    path.join(packageRoot, 'manifest.json'),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    'utf8',
-  );
 }
 
 function main() {
   console.log('==========================================');
   console.log('Echo iOS Dependencies macOS Bundle');
   console.log('==========================================\n');
-
-  ensureFile(uxplayArtifact, 'UxPlay packaged artifact');
-  ensureFile(path.join(ffmpegRoot, 'ffmpeg'), 'ffmpeg binary');
-
-  fs.mkdirSync(distDir, { recursive: true });
-  resetDir(tempDir);
-
-  const packageRoot = path.join(tempDir, 'echo-ios-dependencies-macos');
-  const airplayDir = path.join(packageRoot, 'airplay-bridge');
-  const ffmpegDir = path.join(packageRoot, 'ffmpeg');
-
-  fs.mkdirSync(airplayDir, { recursive: true });
-  fs.mkdirSync(ffmpegDir, { recursive: true });
-
-  console.log('[bundle] Extracting packaged UxPlay artifact...');
-  const zip = new AdmZip(uxplayArtifact);
-  zip.extractAllTo(airplayDir, true);
-
-  const uxplayCandidates = [
-    path.join(airplayDir, 'uxplay'),
-    path.join(airplayDir, 'echo-airplay'),
-  ];
-  const uxplayPath = uxplayCandidates.find((candidate) => fs.existsSync(candidate));
-  if (!uxplayPath) {
-    throw new Error(`Expected uxplay or echo-airplay in ${airplayDir}`);
-  }
-
-  const echoAirplayPath = path.join(airplayDir, 'echo-airplay');
-  if (uxplayPath !== echoAirplayPath) {
-    fs.copyFileSync(uxplayPath, echoAirplayPath);
-  }
-  makeExecutable(echoAirplayPath);
-
-  const wrapperPath = path.join(airplayDir, 'echo-airplay-wrapper.sh');
-  const wrapperScript = `#!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-export GST_PLUGIN_PATH="$SCRIPT_DIR/lib/gstreamer-1.0:$GST_PLUGIN_PATH"
-export DYLD_LIBRARY_PATH="$SCRIPT_DIR/lib:$DYLD_LIBRARY_PATH"
-exec "$SCRIPT_DIR/echo-airplay" "$@"
-`;
-  fs.writeFileSync(wrapperPath, wrapperScript, { mode: 0o755 });
-
-  console.log('[bundle] Copying ffmpeg...');
-  for (const fileName of ['ffmpeg', 'LICENSE', 'README.md', 'ffmpeg.LICENSE', 'ffmpeg.README']) {
-    const copied = copyIfExists(path.join(ffmpegRoot, fileName), path.join(ffmpegDir, fileName));
-    if (copied && fileName === 'ffmpeg') {
-      makeExecutable(path.join(ffmpegDir, fileName));
-    }
-  }
-
-  const topLevelReadme = `Echo iOS Dependencies (macOS)
-
-Contents:
-- airplay-bridge/echo-airplay
-- airplay-bridge/echo-airplay-wrapper.sh
-- ffmpeg/ffmpeg
-
-Install these as a separately distributed companion runtime.
-`;
-  fs.writeFileSync(path.join(packageRoot, 'README.txt'), topLevelReadme, 'utf8');
-  buildManifest(packageRoot);
-
-  console.log('[bundle] Creating downloadable zip...');
-  fs.rmSync(outputZip, { force: true });
-  execSync(`cd "${tempDir}" && zip -r "${outputZip}" "echo-ios-dependencies-macos"`, {
-    stdio: 'inherit',
-  });
-
-  const sizeMb = (fs.statSync(outputZip).size / (1024 * 1024)).toFixed(2);
-  console.log(`\n[bundle] Created ${outputZip} (${sizeMb} MB)`);
+  const { outputZip, sidecar, summary } = bundleMacosCompanion({ minMacOS: process.env[MIN_MACOS_ENV] });
+  console.log(`\n[bundle] Created ${outputZip} (${(summary.size / (1024 * 1024)).toFixed(2)} MB)`);
+  console.log(`[bundle] sha256 ${summary.sha256}`);
+  console.log(`[bundle] arch=${summary.arch} minimumMacOS=${summary.minimumMacOS} buildKind=${summary.buildKind}`);
+  console.log(`[bundle] manifest ${sidecar}`);
+  for (const gap of summary.releaseGaps) console.log(`[bundle] release gap: ${gap}`);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`\nERROR: ${error.message}`);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`\nERROR: ${error.message}`);
+    process.exit(1);
+  }
 }
+
+module.exports = { DEFAULTS, bundleMacosCompanion };
