@@ -11,8 +11,11 @@
     "bundle:windows": "node scripts/bundle-windows-companion.js",
     "build:windows": "npm run build:windows:uxplay && npm run package:windows:uxplay && npm run bundle:windows",
     "build:macos:uxplay": "node uxplay/scripts/download-and-build-uxplay-macos.js",
+    "package:macos:uxplay": "node uxplay/scripts/package-uxplay-macos.js",
     "bundle:macos": "node scripts/bundle-macos-companion.js",
-    "build:macos": "npm run build:macos:uxplay && npm run bundle:macos"
+    "build:macos": "npm run build:macos:uxplay && npm run package:macos:uxplay && npm run bundle:macos",
+    "validate:macos": "node uxplay/scripts/validate-macos-package.js dist/echo-ios-dependencies-macos.zip --runtime",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "devDependencies": {
     "adm-zip": "^0.5.16"

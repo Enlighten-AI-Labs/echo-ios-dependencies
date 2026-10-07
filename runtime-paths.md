@@ -29,4 +29,6 @@ The downloadable macOS bundle is expected to contain:
 - `ffmpeg/`
 - `manifest.json`
 
+On macOS, `airplay-bridge/` must be kept together as one directory. `echo-airplay` loads its libraries from `airplay-bridge/lib/`, its GStreamer plugins from `airplay-bridge/lib/gstreamer-1.0/` and its plugin scanner from `airplay-bridge/libexec/gstreamer-1.0/`, all relative to its own location. It needs no environment variables and no Homebrew.
+
 This repository is intended to distribute those artifacts independently from any desktop application bundle.

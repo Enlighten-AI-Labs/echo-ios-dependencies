@@ -20,9 +20,11 @@ The intent is to keep these artifacts outside any closed-source desktop applicat
 The macOS packaging flow produces:
 
 - `uxplay/resources/temp/airplay-bridge.zip`
-  A packaged iOS bridge binary.
+  A self-contained iOS bridge: `echo-airplay` plus its bundled libraries, GStreamer plugins, plugin scanner, license notices and `provenance.json`.
 - `dist/echo-ios-dependencies-macos.zip`
-  A downloadable bundle containing the companion binaries and notices.
+  A downloadable bundle containing the companion binaries, notices and a `manifest.json` with file hashes, component sources and the exact source commits.
+- `dist/echo-ios-dependencies-macos.manifest.json`
+  The same manifest data plus the final zip's sha256.
 
 The Windows build and packaging flow produces:
 
@@ -47,11 +49,20 @@ Install dependencies:
 npm install
 ```
 
-Build the macOS companion bundle:
+Build the macOS companion bundle. The minimum macOS must be chosen explicitly; the bundle is thin arm64 only:
 
 ```bash
-npm run build:macos
+ECHO_MACOS_MIN_VERSION=26.0 npm run build:macos
 ```
+
+Re-validate an already-built macOS bundle, or run the packaging tests:
+
+```bash
+npm run validate:macos
+npm test
+```
+
+See [uxplay/docs/UXPLAY_BUILD_README.md](./uxplay/docs/UXPLAY_BUILD_README.md) for the macOS support contract and build requirements. Homebrew is only needed at build time.
 
 Build and validate the Windows bridge package:
 

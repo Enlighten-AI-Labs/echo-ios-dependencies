@@ -1,0 +1,58 @@
+# Builds and validates the macOS companion on a throwaway GitHub-hosted runner.
+# Uploads a short-lived CI artifact only: no release publishing, no signing secrets.
+name: macOS companion
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-companion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-15 is Apple silicon (arm64), matching the bundle's thin arm64 contract.
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # Homebrew bottles on this runner target macOS 15; the artifact is labelled "development"
+      # until a production minimum macOS is approved.
+      ECHO_MACOS_MIN_VERSION: '15.0'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Packaging and validation tests
+        run: npm test
+
+      - name: Install build-only dependencies (ephemeral runner)
+        run: brew install cmake pkgconf libplist openssl@3 gstreamer
+
+      - name: Build, package and validate
+        run: npm run build:macos
+
+      - name: Re-validate final bundle
+        run: npm run validate:macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echo-ios-dependencies-macos-${{ github.sha }}
+          path: |
+            dist/echo-ios-dependencies-macos.zip
+            dist/echo-ios-dependencies-macos.manifest.json
+          retention-days: 7
+          if-no-files-found: error
